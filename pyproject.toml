@@ -1,0 +1,22 @@
+[project]
+name = "ovius-backend"
+version = "0.1.0"
+description = "AWS CloudFormation infrastructure, DynamoDB telemetry provisioning, and backend ingestion utilities for the Ovius / AIMLC4 Heavy Equipment Productivity Pipeline."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "boto3>=1.35.0",
+    "boto3-stubs[cloudformation,dynamodb]>=1.35.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

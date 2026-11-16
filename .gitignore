@@ -1,0 +1,19 @@
+# Python & uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local runtime & checkpoints
+.tmp_ingest_checkpoint*
+*.tmp
+.DS_Store
+
+# Large generated seed data (stays in AIMLC4_Playground/mock_data)
+mock_data/
+*.jsonl
+*.json.bak

@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Provision 3-table DynamoDB operational telemetry schema (recording, haul-cycle,
+  state-segment) with On-Demand billing, SSE, PITR, Retain policies, and GSIs
+  matching the AIMLC4 ERD and access patterns.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: "aws-cloudformation@3"
+  com.aws.cloudformation.Context:
+    arch: "3-table relational DynamoDB telemetry store (recording, haul-cycle, state-segment); math constants live client-side in SwiftData settings"
+    must:
+      - "Preserve Retention/UpdateReplacePolicy Retain on all stateful tables"
+      - "Include mandatory Owner/Project/Iteration tags across all resources"
+      - "Keep Primary Keys aligned with database_schema_plan.md literals (recording_id, cycle_id, segment_id)"
+    ref:
+      - at: ../AIMLC4_Playground/docs/database_schema_plan.md
+        has: 3-table ERD, PKs, and SwiftData decoupling specification
+        scope: schema
+      - at: ../AIMLC4_Playground/docs/aws_architecture_plan.md
+        has: DynamoDB PAY_PER_REQUEST operational storage tier specification
+        scope: architecture
+    owner: project8
+
+Parameters:
+  TablePrefix:
+    Type: String
+    Default: ovius
+    AllowedPattern: "^[a-z0-9-]+$"
+    MinLength: 2
+    MaxLength: 32
+    ConstraintDescription: TablePrefix must contain only lowercase letters, numbers, and hyphens (2-32 chars).
+    Description: Prefix applied to all provisioned DynamoDB table names.
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment tag.
+
+  EnablePointInTimeRecovery:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable DynamoDB continuous point-in-time recovery backups.
+
+Resources:
+  RecordingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores 12-hour CCTV shift metadata and camera selectors; camera-id-timestamp-index enables Section Date Horizon queries without full table scans
+        must:
+          - "Keep recording_id as partition key matching SwiftData section resolver"
+        mutable: change-with-constraints
+    Properties:
+      TableName: !Sub "${TablePrefix}-recording"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recording_id
+          AttributeType: S
+        - AttributeName: camera_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recording_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: camera-id-timestamp-index
+          KeySchema:
+            - AttributeName: camera_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref EnablePointInTimeRecovery
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  HaulCycleTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Uses cycle_id PK per ERD literal with recording-id-index (sorted by t_load_start_s) and recording-excavator-index GSIs for per-shift chronological and per-loader queries
+        must:
+          - "Never hardcode volume payload constants in table items"
+          - "Keep recording-id-index and recording-excavator-index projected ALL so cycle scoops[] arrays return without extra lookups"
+        mutable: must-never-change
+        mutability:
+          GlobalSecondaryIndexes: change-with-constraints
+          Tags: free-to-tune
+    Properties:
+      TableName: !Sub "${TablePrefix}-haul-cycle"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cycle_id
+          AttributeType: S
+        - AttributeName: recording_id
+          AttributeType: S
+        - AttributeName: t_load_start_s
+          AttributeType: N
+        - AttributeName: excavator_sort_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cycle_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: recording-id-index
+          KeySchema:
+            - AttributeName: recording_id
+              KeyType: HASH
+            - AttributeName: t_load_start_s
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: recording-excavator-index
+          KeySchema:
+            - AttributeName: recording_id
+              KeyType: HASH
+            - AttributeName: excavator_sort_key
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref EnablePointInTimeRecovery
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  StateSegmentTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores scoop-granular machine state timeline using segment_id PK per ERD literal with recording-id-index (timeline order by start_s) and cycle-id-index (cycle reconstruction via cycle_sort_key)
+        must:
+          - "Throttle bulk writes containing cycle_id=NONE cleanly within single GSI partition write limits during initial seed upload"
+        mutable: must-never-change
+        mutability:
+          GlobalSecondaryIndexes: change-with-constraints
+          Tags: free-to-tune
+    Properties:
+      TableName: !Sub "${TablePrefix}-state-segment"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: segment_id
+          AttributeType: S
+        - AttributeName: recording_id
+          AttributeType: S
+        - AttributeName: start_s
+          AttributeType: N
+        - AttributeName: cycle_id
+          AttributeType: S
+        - AttributeName: cycle_sort_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: segment_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: recording-id-index
+          KeySchema:
+            - AttributeName: recording_id
+              KeyType: HASH
+            - AttributeName: start_s
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: cycle-id-index
+          KeySchema:
+            - AttributeName: cycle_id
+              KeyType: HASH
+            - AttributeName: cycle_sort_key
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref EnablePointInTimeRecovery
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  RecordingTableName:
+    Description: Provisioned DynamoDB table name for recording metadata
+    Value: !Ref RecordingTable
+
+  RecordingTableArn:
+    Description: ARN of the recording DynamoDB table
+    Value: !GetAtt RecordingTable.Arn
+
+  HaulCycleTableName:
+    Description: Provisioned DynamoDB table name for haul_cycle telemetry
+    Value: !Ref HaulCycleTable
+
+  HaulCycleTableArn:
+    Description: ARN of the haul_cycle DynamoDB table
+    Value: !GetAtt HaulCycleTable.Arn
+
+  StateSegmentTableName:
+    Description: Provisioned DynamoDB table name for state_segment timeline items
+    Value: !Ref StateSegmentTable
+
+  StateSegmentTableArn:
+    Description: ARN of the state_segment DynamoDB table
+    Value: !GetAtt StateSegmentTable.Arn

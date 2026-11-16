@@ -1,0 +1,507 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Provision Ovius frontend data access API (CloudFront -> REST API Gateway ->
+  Python 3.11 Lambda -> DynamoDB) serving raw telemetry with zero server-side math.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: "aws-cloudformation@3"
+  com.aws.cloudformation.Context:
+    arch: "CloudFront HTTPS CDN -> Regional REST API Gateway (/api/v1/*) -> On-Demand arm64 Python 3.11 Lambda -> DynamoDB; zero math on backend"
+    must:
+      - "Include mandatory Owner/Project/Iteration tags on all taggable resources"
+      - "Never grant dynamodb:Scan on ovius-haul-cycle or ovius-state-segment"
+      - "Use Managed-AllViewerExceptHostHeader on CloudFront->APIGW to prevent Host header 403 mismatch"
+    ref:
+      - at: README.md
+        has: Frontend API endpoints, filters, and deployment commands
+        scope: docs
+      - at: AGENTS.md
+        has: Backend AWS tagging, IAM, and zero-math architectural boundaries
+        scope: architecture
+    owner: project8
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment tag.
+
+  TablePrefix:
+    Type: String
+    Default: ovius
+    AllowedPattern: "^[a-z0-9-]+$"
+    MinLength: 2
+    MaxLength: 32
+    ConstraintDescription: TablePrefix must contain only lowercase letters, numbers, and hyphens.
+    Description: Prefix applied to existing DynamoDB tables.
+
+  ApiStageName:
+    Type: String
+    Default: v1
+    AllowedPattern: "^[a-z0-9-]+$"
+    MinLength: 1
+    MaxLength: 24
+    Description: API Gateway deployment stage name.
+
+  RequireApiKey:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: Enable native API Gateway x-api-key enforcement on GET methods.
+
+  AnalyticsBucketName:
+    Type: String
+    Default: ovius-cctv-analytics-apse3
+    Description: Placeholder S3 bucket name echoed in /api/v1/bboxes template responses.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket containing packaged ovius_api Lambda zip artifact.
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: ""
+    Description: Optional S3 object key for packaged ovius_api Lambda zip artifact.
+
+  DeploymentNonce:
+    Type: String
+    Default: v1-initial
+    Description: Identifier stored on ApiGateway Deployment to trigger stage rollouts when methods change.
+
+Conditions:
+  ApiKeyRequiredCond: !Equals [!Ref RequireApiKey, "true"]
+  UseS3CodeCond: !Not [!Equals [!Ref LambdaCodeS3Bucket, ""]]
+
+Resources:
+  OviusApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Explicit 30-day retention log group for Lambda structured logs; avoids account-wide APIGW CW role singleton dependency
+        must:
+          - "Match FunctionName path /aws/lambda/<stack>-data-api"
+        mutable: free-to-tune
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-data-api"
+      RetentionInDays: 30
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusApiLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Least-privilege execution role separating Scan-capable recording discovery from Query-only cycle/segment reads
+        must:
+          - "Keep Scan restricted strictly to recording table for camera_id=* discovery"
+          - "Include /index/* ARNs on all three tables for GSI Query access"
+        mutable: change-with-constraints
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaLogsAndXRay
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt OviusApiLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+        - PolicyName: DynamoDBRecordingsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-recording"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-recording/index/*"
+        - PolicyName: DynamoDBTelemetryQueryOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-haul-cycle"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-haul-cycle/index/*"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-state-segment"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-state-segment/index/*"
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusDataApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OviusApiLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: On-Demand arm64 Python 3.11 Event Function querying DynamoDB raw telemetry; 29s timeout fits REST API max integration limit
+        must:
+          - "Enforce <=4.2MB JSON payload guard in app code to stay under 6MB Lambda sync limit"
+          - "Never perform metric math on backend"
+        mutable: change-with-constraints
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-data-api"
+      Description: Pure DynamoDB telemetry query and pagination handler for Ovius frontend.
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      Handler: ovius_api.handler.lambda_handler
+      Role: !GetAtt OviusApiLambdaRole.Arn
+      MemorySize: 512
+      Timeout: 29
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          RECORDING_TABLE: !Sub "${TablePrefix}-recording"
+          HAUL_CYCLE_TABLE: !Sub "${TablePrefix}-haul-cycle"
+          STATE_SEGMENT_TABLE: !Sub "${TablePrefix}-state-segment"
+          ANALYTICS_S3_BUCKET: !Ref AnalyticsBucketName
+      Code:
+        S3Bucket: !If [UseS3CodeCond, !Ref LambdaCodeS3Bucket, !Ref "AWS::NoValue"]
+        S3Key: !If [UseS3CodeCond, !Ref LambdaCodeS3Key, !Ref "AWS::NoValue"]
+        ZipFile: !If
+          - UseS3CodeCond
+          - !Ref "AWS::NoValue"
+          - |
+            import json
+            def lambda_handler(event, context):
+                return {
+                    "statusCode": 503,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"error": "Lambda package not deployed via S3 yet"})
+                }
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Regional REST API v1 chosen over HTTP API v2 to support native API Gateway ApiKey + UsagePlan when RequireApiKey=true
+        must:
+          - "Keep EndpointConfiguration REGIONAL behind CloudFront"
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub "${AWS::StackName}-rest-api"
+      Description: Ovius frontend data access REST API for telemetry metrics, bbox, and video templates.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ParentId: !GetAtt OviusRestApi.RootResourceId
+      PathPart: api
+
+  ApiV1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ParentId: !Ref ApiResource
+      PathPart: v1
+
+  ApiV1ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ParentId: !Ref ApiV1Resource
+      PathPart: "{proxy+}"
+
+  ApiV1ProxyGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResourceId: !Ref ApiV1ProxyResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [ApiKeyRequiredCond, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OviusDataApiFunction.Arn}/invocations"
+
+  ApiV1ProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResourceId: !Ref ApiV1ProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: MOCK
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 204}'
+        IntegrationResponses:
+          - StatusCode: "204"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+      MethodResponses:
+        - StatusCode: "204"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  OviusGatewayResponse4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+
+  OviusGatewayResponse5XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+
+  OviusLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OviusDataApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OviusRestApi}/*/GET/api/v1/*"
+
+  OviusApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiV1ProxyGetMethod
+      - ApiV1ProxyOptionsMethod
+      - OviusGatewayResponse4XX
+      - OviusGatewayResponse5XX
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      Description: !Sub "Deployment ${DeploymentNonce}"
+
+  OviusApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref ApiStageName
+      RestApiId: !Ref OviusRestApi
+      DeploymentId: !Ref OviusApiDeployment
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 200
+          ThrottlingRateLimit: 100
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: ApiKeyRequiredCond
+    Properties:
+      Name: !Sub "${AWS::StackName}-client-key"
+      Enabled: true
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: ApiKeyRequiredCond
+    DependsOn: OviusApiStage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-usage-plan"
+      ApiStages:
+        - ApiId: !Ref OviusRestApi
+          Stage: !Ref ApiStageName
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 100000
+        Period: DAY
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: ApiKeyRequiredCond
+    Properties:
+      KeyId: !Ref OviusApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref OviusUsagePlan
+
+  OviusFrontendCdn:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Single HTTPS entry point fronting /api/v1/* on API Gateway with future OAC extensibility for /videos/* and /bboxes/*
+        must:
+          - "Keep Managed-CachingDisabled + Managed-AllViewerExceptHostHeader so query params and future x-api-key reach APIGW without Host 403"
+        mutable: change-with-constraints
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} frontend data access distribution"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: OviusRestApiOrigin
+            DomainName: !Sub "${OviusRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+            OriginPath: !Sub "/${ApiStageName}"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: OviusRestApiOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+          OriginRequestPolicyId: "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+          ResponseHeadersPolicyId: "67f7725c-6f97-4210-82d7-5512b31e9d03"
+        CacheBehaviors:
+          - PathPattern: /api/v1/*
+            TargetOriginId: OviusRestApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+            ResponseHeadersPolicyId: "67f7725c-6f97-4210-82d7-5512b31e9d03"
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  CloudFrontDomainName:
+    Description: HTTPS CloudFront domain name for frontend data queries
+    Value: !GetAtt OviusFrontendCdn.DomainName
+
+  CloudFrontBaseUrl:
+    Description: Base HTTPS URL on CloudFront for /api/v1/* endpoints
+    Value: !Sub "https://${OviusFrontendCdn.DomainName}/api/v1"
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution identifier
+    Value: !Ref OviusFrontendCdn
+
+  ApiGatewayUrl:
+    Description: Regional REST API Gateway invoke base URL for /api/v1/*
+    Value: !Sub "https://${OviusRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}/api/v1"
+
+  RestApiId:
+    Description: API Gateway REST API identifier
+    Value: !Ref OviusRestApi
+
+  LambdaFunctionName:
+    Description: Lambda function name serving Ovius telemetry data
+    Value: !Ref OviusDataApiFunction
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN serving Ovius telemetry data
+    Value: !GetAtt OviusDataApiFunction.Arn
