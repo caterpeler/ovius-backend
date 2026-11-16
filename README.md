@@ -3,7 +3,7 @@
 Standalone repository containing all **AWS CloudFormation templates, DynamoDB operational telemetry schemas, and backend AWS ingestion/provisioning tooling** for the Ovius / AIMLC4 Heavy Equipment Productivity Pipeline.
 
 > [!NOTE]
-> All AWS CloudFormation and AWS backend infrastructure code lives in this repository ([`ovius_backend`](file:///Users/vio/PycharmProjects/ovius_backend)). Model training, SageMaker experiments, CCTV dataset balancing, local dashboards, and synthetic mock data generation remain in [`AIMLC4_Playground`](file:///Users/vio/PycharmProjects/AIMLC4_Playground).
+> All AWS CloudFormation and AWS backend infrastructure code lives in this repository ([`ovius_backend`](file:///Users/vio/PycharmProjects/ovius_backend)). Model training scripts live in a separate repository.
 
 ---
 
