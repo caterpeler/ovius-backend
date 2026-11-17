@@ -12,9 +12,19 @@ Standalone repository containing all **AWS CloudFormation templates, DynamoDB op
 ```text
 ovius_backend/
 ├── infra/
-│   └── dynamodb_tables.yaml      # CloudFormation stack for 3-table DynamoDB schema (ovius-*)
+│   ├── dynamodb_tables.yaml      # CloudFormation stack for 3-table DynamoDB schema (ovius-*)
+│   └── api_stack.yaml            # CloudFormation stack: CloudFront -> REST API Gateway -> Lambda
 ├── scripts/
-│   └── ingest_dynamodb.py        # Resumable multi-threaded BatchWriteItem loader & GSI verifier
+│   ├── ingest_dynamodb.py        # Resumable multi-threaded BatchWriteItem loader & GSI verifier
+│   ├── deploy_api.py             # Deterministic zip packager & CFN deployer (ovius-api-backend)
+│   └── verify_api_live.py        # Live API Gateway + CloudFront smoke test suite
+├── src/
+│   └── ovius_api/
+│       ├── filters.py            # Datetime range, Camera ID*, and Decimal cursor validation
+│       ├── repository.py         # Pure DynamoDB raw-telemetry reader (zero server-side math)
+│       └── handler.py            # API Gateway proxy router + CORS + Decimal JSON serializer
+├── tests/
+│   └── test_api_handler.py       # Unit tests for filter parsing, cursors, byte guard & routes
 ├── AGENTS.md                     # Backend AWS engineering guidelines & resource tag guardrails
 ├── pyproject.toml                # Python 3.11 project & uv dependencies (boto3, boto3-stubs)
 └── README.md
@@ -79,4 +89,30 @@ uv run python scripts/ingest_dynamodb.py \
   --region ap-southeast-3 \
   --table-prefix ovius \
   --workers 28
+```
+
+### 4.3 Frontend Data Access Interface (`CloudFront -> API Gateway -> Lambda -> DynamoDB`)
+Provisioned via [`infra/api_stack.yaml`](file:///Users/vio/PycharmProjects/ovius_backend/infra/api_stack.yaml) (`StackName: ovius-api-backend` in `ap-southeast-3` under `Project8LambdaExecutionRole`). All metric math happens on the frontend; the backend serves filtered, projected, and paginated raw DynamoDB telemetry (`ovius-recording` `990` items, `ovius-haul-cycle` `366,972` items, `ovius-state-segment` `4,318,852` items) with a `4.2 MB` JSON payload guard plus template endpoints for `bboxes` and `videos`.
+
+- **CloudFront Base URL:** `https://d1zj4agypqh81v.cloudfront.net/api/v1` (Distribution `E21IWGD0JCX7OL`, `Managed-CachingDisabled` + `Managed-AllViewerExceptHostHeader` + `Managed-SecurityHeadersPolicy`)
+- **API Gateway Base URL:** `https://4jg1b9qut2.execute-api.ap-southeast-3.amazonaws.com/v1/api/v1` (REST API `4jg1b9qut2`, Stage `v1`, `AuthType: NONE` with `RequireApiKey` parameter ready for future `x-api-key`)
+- **Lambda Function:** `ovius-api-backend-data-api` (Python 3.11 `arm64`, `512 MB`, `29s` timeout, wave-parallel DynamoDB querying + lossless `Decimal` `next_token` pagination)
+- **Routes:**
+  - `GET /api/v1/metrics` *(composite recordings + haul_cycles + optional `include_segments=true`)*
+  - `GET /api/v1/metrics/recordings`
+  - `GET /api/v1/metrics/cycles`
+  - `GET /api/v1/metrics/segments`
+  - `GET /api/v1/bboxes` *(template)*
+  - `GET /api/v1/videos` *(template)*
+- **Filters:** `start_time`, `end_time` (`YYYY-MM-DD` or ISO-8601), `tod_start_s`, `tod_end_s`, `camera_id` (`*` or comma-separated), `location_tag`, `tag`, `filename`, `recording_id`, `cycle_id`, `excavator_id`, `state` (comma-separated, e.g. `idle`), `include_scoops` (`true|false`), `include_segments` (`true|false`), `limit` (`1..15000`), `next_token`.
+
+```bash
+# Run unit tests
+uv run pytest -v
+
+# Package & deploy CloudFormation API stack (ovius-api-backend)
+uv run python scripts/deploy_api.py
+
+# Verify live API Gateway + CloudFront endpoints
+uv run python scripts/verify_api_live.py
 ```

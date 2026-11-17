@@ -24,6 +24,7 @@ DEFAULT_PROFILE = "610331148578_Project8Learner"
 DEFAULT_REGION = "ap-southeast-3"
 DEFAULT_S3_BUCKET = "sagemaker-savio-p8-apse3"
 DEFAULT_S3_PREFIX = "artifacts/ovius_backend"
+DEFAULT_LAMBDA_ROLE_ARN = "arn:aws:iam::610331148578:role/Project8LambdaExecutionRole"
 
 
 def build_lambda_zip(package_dir: Path) -> tuple[bytes, str]:
@@ -69,6 +70,7 @@ def main() -> int:
     parser.add_argument("--table-prefix", default="ovius")
     parser.add_argument("--env", default="dev", choices=["dev", "staging", "prod"])
     parser.add_argument("--require-api-key", default="false", choices=["false", "true"])
+    parser.add_argument("--lambda-role-arn", default=DEFAULT_LAMBDA_ROLE_ARN)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
 
@@ -94,6 +96,9 @@ def main() -> int:
         exists = False
         try:
             stacks = cfn.describe_stacks(StackName=args.stack_name).get("Stacks", [])
+            if stacks and stacks[0]["StackStatus"] == "DELETE_IN_PROGRESS":
+                cfn.get_waiter("stack_delete_complete").wait(StackName=args.stack_name)
+                stacks = []
             exists = bool(stacks and stacks[0]["StackStatus"] != "REVIEW_IN_PROGRESS")
         except ClientError as exc:
             if "does not exist" not in str(exc):
@@ -107,6 +112,7 @@ def main() -> int:
             {"ParameterKey": "RequireApiKey", "ParameterValue": args.require_api_key},
             {"ParameterKey": "LambdaCodeS3Bucket", "ParameterValue": "" if args.validate_only else args.s3_bucket},
             {"ParameterKey": "LambdaCodeS3Key", "ParameterValue": "" if args.validate_only else s3_key},
+            {"ParameterKey": "LambdaExecutionRoleArn", "ParameterValue": args.lambda_role_arn},
             {"ParameterKey": "DeploymentNonce", "ParameterValue": f"{args.env}-{sha12}"},
         ]
         tags = [
@@ -166,6 +172,14 @@ def main() -> int:
         waiter.wait(StackName=args.stack_name, WaiterConfig={"Delay": 10, "MaxAttempts": 120})
 
         stack = cfn.describe_stacks(StackName=args.stack_name)["Stacks"][0]
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        if exists and "RestApiId" in outputs:
+            apigw = session.client("apigateway", config=cfg)
+            apigw.create_deployment(
+                restApiId=outputs["RestApiId"],
+                stageName="v1",
+                description=f"Stage rollout {sha12}",
+            )
         print(
             json.dumps(
                 {

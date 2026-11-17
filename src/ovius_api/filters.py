@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import json
 from typing import Any
 
@@ -12,7 +13,7 @@ DEFAULT_LOOKBACK_DAYS = 7
 DEFAULT_TOD_START_S = 0.0
 DEFAULT_TOD_END_S = 43200.0
 DEFAULT_LIMIT = 1000
-MAX_LIMIT = 5000
+MAX_LIMIT = 15000
 OPEN_END_ISO = "9999-12-31T23:59:59+00:00"
 
 
@@ -28,12 +29,17 @@ class QueryFilters:
     end_time: str | None
     camera_ids: tuple[str, ...] | None
     recording_ids: tuple[str, ...] | None
+    location_tags: tuple[str, ...] | None
+    tags: tuple[str, ...] | None
+    filenames: tuple[str, ...] | None
+    states: tuple[str, ...] | None
     cycle_id: str | None
     excavator_id: str | None
     tod_start_s: float
     tod_end_s: float
     limit: int
     include_segments: bool
+    include_scoops: bool
     next_token: dict[str, Any] | None
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -43,17 +49,43 @@ class QueryFilters:
             "end_time": self.end_time,
             "camera_id": list(self.camera_ids) if self.camera_ids else ["*"],
             "recording_id": list(self.recording_ids) if self.recording_ids else None,
+            "location_tag": list(self.location_tags) if self.location_tags else None,
+            "tag": list(self.tags) if self.tags else None,
+            "filename": list(self.filenames) if self.filenames else None,
+            "state": list(self.states) if self.states else None,
             "cycle_id": self.cycle_id,
             "excavator_id": self.excavator_id,
             "tod_start_s": self.tod_start_s,
             "tod_end_s": self.tod_end_s,
+            "include_scoops": self.include_scoops,
             "limit": self.limit,
         }
 
 
+def _encode_cursor_obj(val: Any) -> Any:
+    if isinstance(val, Decimal):
+        return {"__decimal__": str(val)}
+    if isinstance(val, dict):
+        return {k: _encode_cursor_obj(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_encode_cursor_obj(item) for item in val]
+    return val
+
+
+def _decode_cursor_obj(val: Any) -> Any:
+    if isinstance(val, dict):
+        if list(val.keys()) == ["__decimal__"] and isinstance(val["__decimal__"], str):
+            return Decimal(val["__decimal__"])
+        return {k: _decode_cursor_obj(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_decode_cursor_obj(item) for item in val]
+    return val
+
+
 def encode_cursor(payload: dict[str, Any]) -> str:
-    """Encode pagination state as a URL-safe base64 token."""
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    """Encode pagination state as a URL-safe base64 token, preserving Decimal keys."""
+    safe_payload = _encode_cursor_obj(payload)
+    raw = json.dumps(safe_payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
@@ -63,11 +95,12 @@ def decode_cursor(token: str) -> dict[str, Any]:
         padded = token + "=" * (-len(token) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
         obj = json.loads(decoded.decode("utf-8"))
+        restored = _decode_cursor_obj(obj)
     except Exception as exc:  # noqa: BLE001
         raise FilterValidationError("Invalid next_token cursor") from exc
-    if not isinstance(obj, dict):
+    if not isinstance(restored, dict):
         raise FilterValidationError("Invalid next_token payload shape")
-    return obj
+    return restored
 
 
 def _parse_iso_datetime(value: str, *, is_end: bool) -> datetime:
@@ -164,6 +197,10 @@ def parse_query_filters(
 ) -> QueryFilters:
     """Parse and validate API Gateway query parameters into QueryFilters."""
     rec_ids = _extract_param_list(event, "recording_id")
+    location_tags = _extract_param_list(event, "location_tag")
+    tags = _extract_param_list(event, "tag")
+    filenames = _extract_param_list(event, "filename")
+    states = _extract_param_list(event, "state")
     cycle_id = _extract_single(event, "cycle_id")
     excavator_id = _extract_single(event, "excavator_id")
 
@@ -244,6 +281,10 @@ def parse_query_filters(
         _extract_single(event, "include_segments"),
         default=False,
     )
+    include_scoops = _parse_bool(
+        _extract_single(event, "include_scoops"),
+        default=True,
+    )
 
     raw_token = _extract_single(event, "next_token")
     cursor = decode_cursor(raw_token) if raw_token is not None else None
@@ -253,11 +294,16 @@ def parse_query_filters(
         end_time=end_iso,
         camera_ids=camera_ids,
         recording_ids=tuple(dict.fromkeys(rec_ids)) if rec_ids else None,
+        location_tags=tuple(dict.fromkeys(location_tags)) if location_tags else None,
+        tags=tuple(dict.fromkeys(tags)) if tags else None,
+        filenames=tuple(dict.fromkeys(filenames)) if filenames else None,
+        states=tuple(dict.fromkeys(states)) if states else None,
         cycle_id=cycle_id,
         excavator_id=excavator_id,
         tod_start_s=tod_start_s,
         tod_end_s=tod_end_s,
         limit=limit,
         include_segments=include_segments,
+        include_scoops=include_scoops,
         next_token=cursor,
     )

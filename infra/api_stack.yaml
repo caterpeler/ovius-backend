@@ -76,9 +76,15 @@ Parameters:
     Default: v1-initial
     Description: Identifier stored on ApiGateway Deployment to trigger stage rollouts when methods change.
 
+  LambdaExecutionRoleArn:
+    Type: String
+    Default: ""
+    Description: Optional pre-provisioned IAM role ARN for the Lambda function (used in sandboxed accounts without iam:CreateRole).
+
 Conditions:
   ApiKeyRequiredCond: !Equals [!Ref RequireApiKey, "true"]
   UseS3CodeCond: !Not [!Equals [!Ref LambdaCodeS3Bucket, ""]]
+  CreateLambdaRoleCond: !Equals [!Ref LambdaExecutionRoleArn, ""]
 
 Resources:
   OviusApiLogGroup:
@@ -104,6 +110,7 @@ Resources:
 
   OviusApiLambdaRole:
     Type: AWS::IAM::Role
+    Condition: CreateLambdaRoleCond
     Metadata:
       com.aws.cloudformation.Context:
         why: Least-privilege execution role separating Scan-capable recording discovery from Query-only cycle/segment reads
@@ -188,11 +195,14 @@ Resources:
       Architectures:
         - arm64
       Handler: ovius_api.handler.lambda_handler
-      Role: !GetAtt OviusApiLambdaRole.Arn
+      Role: !If
+        - CreateLambdaRoleCond
+        - !GetAtt OviusApiLambdaRole.Arn
+        - !Ref LambdaExecutionRoleArn
       MemorySize: 512
       Timeout: 29
       TracingConfig:
-        Mode: Active
+        Mode: !If [CreateLambdaRoleCond, Active, PassThrough]
       Environment:
         Variables:
           RECORDING_TABLE: !Sub "${TablePrefix}-recording"

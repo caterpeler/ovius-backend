@@ -14,6 +14,17 @@ from ovius_api.handler import lambda_handler
 from ovius_api.repository import MAX_PAYLOAD_BYTES, TelemetryRepository, json_safe
 
 
+def _extract_condition_strings(cond: Any) -> list[str]:
+    expr = cond.get_expression()
+    found: list[str] = []
+    for val in expr.get("values", ()):
+        if hasattr(val, "get_expression"):
+            found.extend(_extract_condition_strings(val))
+        elif isinstance(val, str):
+            found.append(val)
+    return found
+
+
 class _FakeRecordingTable:
     name = "ovius-recording"
 
@@ -24,7 +35,10 @@ class _FakeRecordingTable:
 
     def query(self, **kwargs: Any) -> dict[str, Any]:
         self.queries.append(kwargs)
-        return {"Items": self.recordings}
+        strs = _extract_condition_strings(kwargs["KeyConditionExpression"])
+        cam_id = next((s for s in strs if s.startswith("CAM-")), None)
+        matched = [r for r in self.recordings if cam_id is None or r["camera_id"] == cam_id]
+        return {"Items": matched}
 
     def scan(self, **kwargs: Any) -> dict[str, Any]:
         self.scans.append(kwargs)
@@ -51,13 +65,11 @@ class _FakeChildTable:
 
     @staticmethod
     def _extract_key(kwargs: Any) -> str:
-        # Inspect recorded condition tree cleanly by checking internal expression values
-        cond = kwargs["KeyConditionExpression"]
-        expr = cond.get_expression()
-        for val in expr["values"]:
-            if isinstance(val, str) and not val.startswith("E"):
+        strs = _extract_condition_strings(kwargs["KeyConditionExpression"])
+        for val in strs:
+            if not val.startswith("E"):
                 return val
-        return str(expr["values"][0])
+        return strs[0]
 
 
 class _FakeMetaClient:
@@ -106,6 +118,8 @@ def _sample_recordings() -> list[dict[str, Any]]:
             "recording_id": "mock_sample_1_d001",
             "camera_id": "CAM-ALPHA-01",
             "filename": "2026-08-19_mock_sample_1.mp4",
+            "location_tag": "Section Alpha - Wide Overview Bench",
+            "tags": ["section:Alpha", "day:2026-08-19"],
             "timestamp": "2026-08-19T06:00:00+00:00",
             "duration_s": Decimal("43200.0"),
             "fps": Decimal("25.0"),
@@ -115,6 +129,8 @@ def _sample_recordings() -> list[dict[str, Any]]:
             "recording_id": "mock_sample_2_d001",
             "camera_id": "CAM-BETA-01",
             "filename": "2026-08-19_mock_sample_2.mp4",
+            "location_tag": "Section Beta - Queue Bottleneck Bench",
+            "tags": ["section:Beta", "day:2026-08-19"],
             "timestamp": "2026-08-19T06:00:00+00:00",
             "duration_s": Decimal("43200.0"),
             "fps": Decimal("25.0"),
@@ -189,6 +205,17 @@ def test_json_safe_converts_decimals() -> None:
     assert converted["scoop_number"] == 2
     assert isinstance(converted["t_arrive_s"], float)
     assert converted["t_arrive_s"] == 12.35
+
+
+def test_cursor_round_trips_decimal_last_evaluated_key() -> None:
+    from ovius_api.filters import decode_cursor, encode_cursor
+
+    lek = {"recording_id": "r1", "cycle_id": "c1", "t_load_start_s": Decimal("1234.56")}
+    token = encode_cursor({"rec_idx": 0, "lek": lek})
+    decoded = decode_cursor(token)
+    assert decoded["rec_idx"] == 0
+    assert isinstance(decoded["lek"]["t_load_start_s"], Decimal)
+    assert decoded["lek"]["t_load_start_s"] == Decimal("1234.56")
 
 
 def test_handler_routes_metrics_cycles_segments_and_templates() -> None:
@@ -292,6 +319,42 @@ def test_handler_routes_metrics_cycles_segments_and_templates() -> None:
     assert body_vid["query_type"] == "videos"
     assert body_vid["items"][0]["stream_url"] == "/videos/CAM-ALPHA-01/2026-08-19_mock_sample_1.mp4"
 
+    # Composite /api/v1/metrics with include_segments=true and wildcard camera_id
+    resp_both = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics",
+            "queryStringParameters": {
+                "recording_id": "mock_sample_1_d001",
+                "include_segments": "true",
+                "limit": "10",
+            },
+        },
+        repository=repo,
+    )
+    assert resp_both["statusCode"] == 200
+    body_both = json.loads(resp_both["body"])
+    assert len(body_both["haul_cycles"]) == 2
+    assert len(body_both["state_segments"]) == 1
+    assert body_both["pagination"]["next_token"] is None
+
+    # excavator_id filter routes to recording-excavator-index
+    resp_exc = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/cycles",
+            "queryStringParameters": {
+                "recording_id": "mock_sample_1_d001",
+                "excavator_id": "E1",
+                "tod_start_s": "100",
+                "tod_end_s": "500",
+            },
+        },
+        repository=repo,
+    )
+    assert resp_exc["statusCode"] == 200
+    assert repo._ddb.cyc_table.queries[-1]["IndexName"] == "recording-excavator-index"
+
 
 def test_handler_options_404_405_and_byte_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     recs = _sample_recordings()
@@ -325,3 +388,139 @@ def test_handler_options_404_405_and_byte_guard(monkeypatch: pytest.MonkeyPatch)
 
     post_resp = lambda_handler({"httpMethod": "POST", "path": "/api/v1/metrics"}, repository=repo)
     assert post_resp["statusCode"] == 405
+
+
+def test_efficiency_filters_projection_and_wave_parallel_truncation() -> None:
+    recs = _sample_recordings()
+    # Multi-item single chunk per recording so wave-parallelism & mid-chunk lek_builder are both exercised
+    cycles = {
+        "mock_sample_1_d001": [
+            [
+                {
+                    "recording_id": "mock_sample_1_d001",
+                    "cycle_id": "c1",
+                    "t_load_start_s": Decimal("100.0"),
+                },
+                {
+                    "recording_id": "mock_sample_1_d001",
+                    "cycle_id": "c2",
+                    "t_load_start_s": Decimal("200.0"),
+                },
+            ]
+        ],
+        "mock_sample_2_d001": [
+            [
+                {
+                    "recording_id": "mock_sample_2_d001",
+                    "cycle_id": "c3",
+                    "t_load_start_s": Decimal("300.0"),
+                },
+                {
+                    "recording_id": "mock_sample_2_d001",
+                    "cycle_id": "c4",
+                    "t_load_start_s": Decimal("400.0"),
+                },
+            ]
+        ],
+    }
+    segs = {
+        "mock_sample_1_d001": [
+            [
+                {
+                    "segment_id": "s1",
+                    "recording_id": "mock_sample_1_d001",
+                    "start_s": Decimal("10.0"),
+                    "state": "idle",
+                }
+            ]
+        ]
+    }
+    repo = TelemetryRepository(ddb_resource=_FakeDynamoResource(recs, cycles, segs))
+
+    # 1. location_tag / tag / filename selector filtering on recordings
+    r_tag = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/recordings",
+            "queryStringParameters": {
+                "start_time": "2026-08-19",
+                "end_time": "2026-08-19",
+                "tag": "section:Beta",
+            },
+        },
+        repository=repo,
+    )
+    assert [r["recording_id"] for r in json.loads(r_tag["body"])["recordings"]] == ["mock_sample_2_d001"]
+
+    r_loc = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/recordings",
+            "queryStringParameters": {
+                "start_time": "2026-08-19",
+                "end_time": "2026-08-19",
+                "location_tag": "Section Alpha - Wide Overview Bench",
+                "filename": "2026-08-19_mock_sample_1.mp4",
+            },
+        },
+        repository=repo,
+    )
+    assert [r["recording_id"] for r in json.loads(r_loc["body"])["recordings"]] == ["mock_sample_1_d001"]
+
+    # 2. include_scoops=false adds DynamoDB ProjectionExpression & max limit 15000 is allowed
+    r_proj = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/cycles",
+            "queryStringParameters": {
+                "start_time": "2026-08-19",
+                "end_time": "2026-08-19",
+                "camera_id": "*",
+                "include_scoops": "false",
+                "limit": "15000",
+            },
+        },
+        repository=repo,
+    )
+    assert r_proj["statusCode"] == 200
+    body_proj = json.loads(r_proj["body"])
+    assert [c["cycle_id"] for c in body_proj["haul_cycles"]] == ["c1", "c2", "c3", "c4"]
+    assert "ProjectionExpression" in repo._ddb.cyc_table.queries[-1]
+    assert "scoops" not in repo._ddb.cyc_table.queries[-1]["ProjectionExpression"]
+
+    # 3. Wave-parallel partial limit (limit=3 trims inside second recording cleanly via lek_builder)
+    r_trim = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/cycles",
+            "queryStringParameters": {
+                "start_time": "2026-08-19",
+                "end_time": "2026-08-19",
+                "camera_id": "*",
+                "limit": "3",
+            },
+        },
+        repository=repo,
+    )
+    body_trim = json.loads(r_trim["body"])
+    assert [c["cycle_id"] for c in body_trim["haul_cycles"]] == ["c1", "c2", "c3"]
+    assert body_trim["pagination"]["next_token"] is not None
+
+    # 4. state filter attaches FilterExpression cleanly on segments
+    r_state = lambda_handler(
+        {
+            "httpMethod": "GET",
+            "path": "/api/v1/metrics/segments",
+            "queryStringParameters": {
+                "recording_id": "mock_sample_1_d001",
+                "state": "idle,out_of_frame",
+            },
+        },
+        repository=repo,
+    )
+    assert r_state["statusCode"] == 200
+    assert "FilterExpression" in repo._ddb.seg_table.queries[-1]
+
+    # 5. limit > 15000 rejected cleanly
+    with pytest.raises(FilterValidationError):
+        parse_query_filters({"queryStringParameters": {"limit": "15001"}})

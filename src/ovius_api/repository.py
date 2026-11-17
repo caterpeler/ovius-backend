@@ -20,7 +20,14 @@ from ovius_api.filters import (
 
 MAX_PAYLOAD_BYTES = 4_200_000
 DYNAMO_CHUNK_CAP = 500
+FILTERED_CHUNK_CAP = 1500
 MAX_QUERY_WORKERS = 11
+
+CYCLE_SUMMARY_PROJECTION = (
+    "recording_id, cycle_id, excavator_id, excavator_sort_key, truck_label, "
+    "cycle_status, t_arrive_s, t_spot_s, t_load_start_s, t_load_end_s, "
+    "t_depart_s, queue_time_s"
+)
 
 _DEFAULT_RESOURCE_CONFIG = Config(
     retries={"total_max_attempts": 10, "mode": "adaptive"},
@@ -151,9 +158,13 @@ class TelemetryRepository:
                     break
                 scan_kwargs["ExclusiveStartKey"] = lek
 
-        normalized = [json_safe(row) for row in items]
-        normalized.sort(key=lambda r: (str(r.get("timestamp", "")), str(r.get("recording_id", ""))))
-        return normalized
+        normalized = [json_safe(row) for row in self._filter_recordings_in_memory(items, filters)]
+        deduped: dict[str, dict[str, Any]] = {}
+        for rec in normalized:
+            deduped[str(rec.get("recording_id", ""))] = rec
+        ordered = list(deduped.values())
+        ordered.sort(key=lambda r: (str(r.get("timestamp", "")), str(r.get("recording_id", ""))))
+        return ordered
 
     @staticmethod
     def _filter_recordings_in_memory(
@@ -162,9 +173,21 @@ class TelemetryRepository:
     ) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
         allowed_cams = set(filters.camera_ids) if filters.camera_ids else None
+        allowed_locs = set(filters.location_tags) if filters.location_tags else None
+        allowed_tags = set(filters.tags) if filters.tags else None
+        allowed_files = set(filters.filenames) if filters.filenames else None
+
         for row in items:
             if allowed_cams is not None and row.get("camera_id") not in allowed_cams:
                 continue
+            if allowed_locs is not None and row.get("location_tag") not in allowed_locs:
+                continue
+            if allowed_files is not None and row.get("filename") not in allowed_files:
+                continue
+            if allowed_tags is not None:
+                row_tags = set(row.get("tags") or [])
+                if not row_tags.intersection(allowed_tags):
+                    continue
             ts = str(row.get("timestamp", ""))
             if filters.start_time is not None and ts < filters.start_time:
                 continue
@@ -210,66 +233,183 @@ class TelemetryRepository:
             },
         }
 
+    @staticmethod
+    def _query_single_recording(
+        *,
+        table: Any,
+        index_name: str,
+        build_key_condition: Callable[[str], ConditionBase],
+        filter_expression: ConditionBase | None,
+        projection_expression: str | None,
+        lek_builder: Callable[[dict[str, Any]], dict[str, Any]],
+        rec_id: str,
+        start_lek: dict[str, Any] | None,
+        max_items: int,
+        max_bytes: int,
+    ) -> tuple[list[dict[str, Any]], int, bool, dict[str, Any] | None]:
+        """Query one recording_id until exhausted or local item/byte budget fills."""
+        raw_items: list[dict[str, Any]] = []
+        used_bytes = 0
+        lek = start_lek
+        cap = FILTERED_CHUNK_CAP if filter_expression is not None else DYNAMO_CHUNK_CAP
+
+        while True:
+            remaining = max_items - len(raw_items)
+            if remaining <= 0 or (raw_items and used_bytes >= max_bytes):
+                return raw_items, used_bytes, False, lek
+
+            chunk_limit = (
+                min(max(remaining * 5, 500), cap)
+                if filter_expression is not None
+                else min(remaining, cap)
+            )
+            query_kwargs: dict[str, Any] = {
+                "IndexName": index_name,
+                "KeyConditionExpression": build_key_condition(rec_id),
+                "Limit": chunk_limit,
+            }
+            if filter_expression is not None:
+                query_kwargs["FilterExpression"] = filter_expression
+            if projection_expression is not None:
+                query_kwargs["ProjectionExpression"] = projection_expression
+            if lek is not None:
+                query_kwargs["ExclusiveStartKey"] = lek
+
+            resp = table.query(**query_kwargs)
+            raw_chunk = resp.get("Items", [])
+            resp_lek = resp.get("LastEvaluatedKey")
+
+            last_taken_raw: dict[str, Any] | None = raw_items[-1] if raw_items else None
+            for raw_item in raw_chunk:
+                converted = json_safe(raw_item)
+                item_bytes = _estimate_bytes(converted) + 1
+                if len(raw_items) >= max_items or (raw_items and used_bytes + item_bytes > max_bytes):
+                    exact_lek = lek_builder(last_taken_raw) if last_taken_raw is not None else lek
+                    return raw_items, used_bytes, False, exact_lek
+                raw_items.append(raw_item)
+                last_taken_raw = raw_item
+                used_bytes += item_bytes
+
+            lek = resp_lek
+            if not lek:
+                return raw_items, used_bytes, True, None
+            if len(raw_items) >= max_items or used_bytes >= max_bytes:
+                return raw_items, used_bytes, False, lek
+
     def _paginate_child_table(
         self,
         *,
         table: Any,
         index_name: str,
         build_key_condition: Callable[[str], ConditionBase],
+        filter_expression: ConditionBase | None,
+        projection_expression: str | None,
+        lek_builder: Callable[[dict[str, Any]], dict[str, Any]],
         recording_ids: list[str],
         start_rec_idx: int,
         start_lek: dict[str, Any] | None,
         max_items: int,
         max_bytes: int,
     ) -> tuple[list[dict[str, Any]], int, int | None, dict[str, Any] | None]:
-        """Shared paginated reader across sorted recording_ids with payload byte guard."""
+        """Wave-parallel paginated reader across sorted recording_ids with payload byte guard."""
         collected: list[dict[str, Any]] = []
         used_bytes = 0
 
         if start_rec_idx >= len(recording_ids) or max_items <= 0:
             return collected, used_bytes, None, None
 
-        for idx in range(start_rec_idx, len(recording_ids)):
-            rec_id = recording_ids[idx]
-            lek = start_lek if idx == start_rec_idx else None
+        idx = start_rec_idx
+        lek = start_lek
 
-            while True:
-                remaining = max_items - len(collected)
-                if remaining <= 0 or (collected and used_bytes >= max_bytes):
-                    return collected, used_bytes, idx, lek
+        while idx < len(recording_ids) and len(collected) < max_items and used_bytes < max_bytes:
+            remaining_items = max_items - len(collected)
+            remaining_bytes = max_bytes - used_bytes
 
-                query_kwargs: dict[str, Any] = {
-                    "IndexName": index_name,
-                    "KeyConditionExpression": build_key_condition(rec_id),
-                    "Limit": min(remaining, DYNAMO_CHUNK_CAP),
-                }
-                if lek is not None:
-                    query_kwargs["ExclusiveStartKey"] = lek
+            if lek is not None or remaining_items <= 200 or len(recording_ids) - idx == 1:
+                wave_size = 1
+            elif remaining_items <= 1000:
+                wave_size = min(4, len(recording_ids) - idx)
+            else:
+                wave_size = min(MAX_QUERY_WORKERS, len(recording_ids) - idx)
 
-                resp = table.query(**query_kwargs)
-                raw_chunk = resp.get("Items", [])
-                lek = resp.get("LastEvaluatedKey")
+            if wave_size == 1:
+                wave_results = [
+                    self._query_single_recording(
+                        table=table,
+                        index_name=index_name,
+                        build_key_condition=build_key_condition,
+                        filter_expression=filter_expression,
+                        projection_expression=projection_expression,
+                        lek_builder=lek_builder,
+                        rec_id=recording_ids[idx],
+                        start_lek=lek,
+                        max_items=remaining_items,
+                        max_bytes=remaining_bytes,
+                    )
+                ]
+            else:
+                wave_recs = recording_ids[idx : idx + wave_size]
 
-                for raw_item in raw_chunk:
+                def _fetch_one(r_id: str) -> tuple[list[dict[str, Any]], int, bool, dict[str, Any] | None]:
+                    return self._query_single_recording(
+                        table=table,
+                        index_name=index_name,
+                        build_key_condition=build_key_condition,
+                        filter_expression=filter_expression,
+                        projection_expression=projection_expression,
+                        lek_builder=lek_builder,
+                        rec_id=r_id,
+                        start_lek=None,
+                        max_items=remaining_items,
+                        max_bytes=remaining_bytes,
+                    )
+
+                with ThreadPoolExecutor(max_workers=wave_size) as pool:
+                    wave_results = list(pool.map(_fetch_one, wave_recs))
+
+            lek = None
+            for offset_i, (raw_items, _, exhausted, rec_lek) in enumerate(wave_results):
+                cur_idx = idx + offset_i
+                last_taken_raw: dict[str, Any] | None = None
+                for raw_item in raw_items:
                     item = json_safe(raw_item)
+                    item_bytes = _estimate_bytes(item) + 1
+                    if len(collected) >= max_items or (collected and used_bytes + item_bytes > max_bytes):
+                        exact_lek = lek_builder(last_taken_raw) if last_taken_raw is not None else None
+                        return collected, used_bytes, cur_idx, exact_lek
                     collected.append(item)
-                    used_bytes += _estimate_bytes(item) + 1
+                    last_taken_raw = raw_item
+                    used_bytes += item_bytes
 
-                if not lek:
-                    break
-                if len(collected) >= max_items or used_bytes >= max_bytes:
-                    return collected, used_bytes, idx, lek
+                if not exhausted:
+                    return collected, used_bytes, cur_idx, rec_lek
 
-            if len(collected) >= max_items or used_bytes >= max_bytes:
-                if idx + 1 < len(recording_ids):
-                    return collected, used_bytes, idx + 1, None
-                return collected, used_bytes, None, None
+            idx += wave_size
 
+        if idx < len(recording_ids):
+            return collected, used_bytes, idx, lek
         return collected, used_bytes, None, None
 
-    def _cycle_query_spec(self, filters: QueryFilters) -> tuple[str, Callable[[str], ConditionBase]]:
+    @staticmethod
+    def _state_filter_expression(filters: QueryFilters) -> ConditionBase | None:
+        if not filters.states:
+            return None
+        if len(filters.states) == 1:
+            return Attr("state").eq(filters.states[0])
+        return Attr("state").is_in(list(filters.states))
+
+    def _cycle_query_spec(
+        self,
+        filters: QueryFilters,
+    ) -> tuple[
+        str,
+        Callable[[str], ConditionBase],
+        str | None,
+        Callable[[dict[str, Any]], dict[str, Any]],
+    ]:
         start_dec = Decimal(str(filters.tod_start_s))
         end_dec = Decimal(str(filters.tod_end_s))
+        projection = None if filters.include_scoops else CYCLE_SUMMARY_PROJECTION
         if filters.excavator_id:
             start_ms = int(round(filters.tod_start_s * 1000))
             end_ms = int(round(filters.tod_end_s * 1000))
@@ -279,20 +419,46 @@ class TelemetryRepository:
                 "recording-excavator-index",
                 lambda rec_id: Key("recording_id").eq(rec_id)
                 & Key("excavator_sort_key").between(low, high),
+                projection,
+                lambda raw: {
+                    "cycle_id": raw["cycle_id"],
+                    "recording_id": raw["recording_id"],
+                    "excavator_sort_key": raw["excavator_sort_key"],
+                },
             )
         return (
             "recording-id-index",
             lambda rec_id: Key("recording_id").eq(rec_id)
             & Key("t_load_start_s").between(start_dec, end_dec),
+            projection,
+            lambda raw: {
+                "cycle_id": raw["cycle_id"],
+                "recording_id": raw["recording_id"],
+                "t_load_start_s": raw["t_load_start_s"],
+            },
         )
 
-    def _segment_query_spec(self, filters: QueryFilters) -> tuple[str, Callable[[str], ConditionBase]]:
+    def _segment_query_spec(
+        self,
+        filters: QueryFilters,
+    ) -> tuple[
+        str,
+        Callable[[str], ConditionBase],
+        ConditionBase | None,
+        Callable[[dict[str, Any]], dict[str, Any]],
+    ]:
         start_dec = Decimal(str(filters.tod_start_s))
         end_dec = Decimal(str(filters.tod_end_s))
         return (
             "recording-id-index",
             lambda rec_id: Key("recording_id").eq(rec_id)
             & Key("start_s").between(start_dec, end_dec),
+            self._state_filter_expression(filters),
+            lambda raw: {
+                "segment_id": raw["segment_id"],
+                "recording_id": raw["recording_id"],
+                "start_s": raw["start_s"],
+            },
         )
 
     def list_cycles_page(self, filters: QueryFilters) -> dict[str, Any]:
@@ -306,11 +472,14 @@ class TelemetryRepository:
             rec_idx = int(filters.next_token.get("rec_idx", 0))
             lek = filters.next_token.get("lek")
 
-        index_name, build_key = self._cycle_query_spec(filters)
+        index_name, build_key, projection, lek_builder = self._cycle_query_spec(filters)
         cycles, _, next_idx, next_lek = self._paginate_child_table(
             table=self.haul_cycle_table,
             index_name=index_name,
             build_key_condition=build_key,
+            filter_expression=None,
+            projection_expression=projection,
+            lek_builder=lek_builder,
             recording_ids=rec_ids,
             start_rec_idx=rec_idx,
             start_lek=lek,
@@ -336,34 +505,33 @@ class TelemetryRepository:
         """Fetch paginated raw state_segment items by cycle_id or recording filters."""
         if filters.cycle_id:
             lek = filters.next_token.get("lek") if filters.next_token else None
-            segments: list[dict[str, Any]] = []
-            used_bytes = 0
-
-            while True:
-                remaining = filters.limit - len(segments)
-                if remaining <= 0 or (segments and used_bytes >= MAX_PAYLOAD_BYTES):
-                    break
-                query_kwargs: dict[str, Any] = {
-                    "IndexName": "cycle-id-index",
-                    "KeyConditionExpression": Key("cycle_id").eq(filters.cycle_id),
-                    "Limit": min(remaining, DYNAMO_CHUNK_CAP),
-                }
-                if lek is not None:
-                    query_kwargs["ExclusiveStartKey"] = lek
-                resp = self.state_segment_table.query(**query_kwargs)
-                for raw_item in resp.get("Items", []):
-                    item = json_safe(raw_item)
-                    segments.append(item)
-                    used_bytes += _estimate_bytes(item) + 1
-                lek = resp.get("LastEvaluatedKey")
-                if not lek:
-                    break
-
-            next_token = encode_cursor({"lek": lek}) if lek is not None else None
+            state_filter = self._state_filter_expression(filters)
+            segments, _, exhausted, next_lek = self._query_single_recording(
+                table=self.state_segment_table,
+                index_name="cycle-id-index",
+                build_key_condition=lambda cid: Key("cycle_id").eq(cid),
+                filter_expression=state_filter,
+                projection_expression=None,
+                lek_builder=lambda raw: {
+                    "segment_id": raw["segment_id"],
+                    "cycle_id": raw["cycle_id"],
+                    "cycle_sort_key": raw["cycle_sort_key"],
+                },
+                rec_id=filters.cycle_id,
+                start_lek=lek,
+                max_items=filters.limit,
+                max_bytes=MAX_PAYLOAD_BYTES,
+            )
+            converted = [json_safe(row) for row in segments]
+            next_token = (
+                encode_cursor({"lek": next_lek})
+                if not exhausted and next_lek is not None
+                else None
+            )
             return {
-                "state_segments": segments,
+                "state_segments": converted,
                 "pagination": {
-                    "count": len(segments),
+                    "count": len(converted),
                     "next_token": next_token,
                 },
             }
@@ -376,11 +544,14 @@ class TelemetryRepository:
             rec_idx = int(filters.next_token.get("rec_idx", 0))
             lek = filters.next_token.get("lek")
 
-        index_name, build_key = self._segment_query_spec(filters)
+        index_name, build_key, state_filter, lek_builder = self._segment_query_spec(filters)
         segments, _, next_idx, next_lek = self._paginate_child_table(
             table=self.state_segment_table,
             index_name=index_name,
             build_key_condition=build_key,
+            filter_expression=state_filter,
+            projection_expression=None,
+            lek_builder=lek_builder,
             recording_ids=rec_ids,
             start_rec_idx=rec_idx,
             start_lek=lek,
@@ -429,11 +600,14 @@ class TelemetryRepository:
         used_bytes = 0
 
         if stage == "cycles":
-            cyc_index, cyc_key = self._cycle_query_spec(filters)
+            cyc_index, cyc_key, cyc_proj, cyc_lek = self._cycle_query_spec(filters)
             haul_cycles, cyc_bytes, cyc_next_idx, cyc_next_lek = self._paginate_child_table(
                 table=self.haul_cycle_table,
                 index_name=cyc_index,
                 build_key_condition=cyc_key,
+                filter_expression=None,
+                projection_expression=cyc_proj,
+                lek_builder=cyc_lek,
                 recording_ids=rec_ids,
                 start_rec_idx=rec_idx,
                 start_lek=lek,
@@ -451,14 +625,17 @@ class TelemetryRepository:
                 rec_idx = 0
                 lek = None
 
-        if stage == "segments" and filters.include_segments and next_token is None:
+        if stage == "segments" and filters.include_segments and next_token is None and rec_ids:
             rem_bytes = budget_bytes - used_bytes
             if remaining_items > 0 and rem_bytes > 100_000:
-                seg_index, seg_key = self._segment_query_spec(filters)
+                seg_index, seg_key, seg_filter, seg_lek = self._segment_query_spec(filters)
                 state_segments, _, seg_next_idx, seg_next_lek = self._paginate_child_table(
                     table=self.state_segment_table,
                     index_name=seg_index,
                     build_key_condition=seg_key,
+                    filter_expression=seg_filter,
+                    projection_expression=None,
+                    lek_builder=seg_lek,
                     recording_ids=rec_ids,
                     start_rec_idx=rec_idx,
                     start_lek=lek,
@@ -469,7 +646,7 @@ class TelemetryRepository:
                     next_token = encode_cursor(
                         {"stage": "segments", "rec_idx": seg_next_idx, "lek": seg_next_lek}
                     )
-            else:
+            elif rec_idx < len(rec_ids):
                 next_token = encode_cursor({"stage": "segments", "rec_idx": rec_idx, "lek": lek})
 
         return {
