@@ -1,17 +1,17 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Provision 3-table DynamoDB operational telemetry schema (recording, haul-cycle,
-  state-segment) with On-Demand billing, SSE, PITR, Retain policies, and GSIs
-  matching the AIMLC4 ERD and access patterns.
+  Provision 4-table DynamoDB operational telemetry and Phase 2 ingest-state
+  schema plus the ap-southeast-1 pipeline S3 bucket with On-Demand billing,
+  SSE, PITR, Retain policies, lifecycle rules, CORS, and TLS-only access.
 
 Metadata:
   AWSToolsMetrics:
     AWSAgentToolkit: "aws-cloudformation@3"
   com.aws.cloudformation.Context:
-    arch: "3-table relational DynamoDB telemetry store (recording, haul-cycle, state-segment); math constants live client-side in SwiftData settings"
+    arch: "4-table DynamoDB store (recording, haul-cycle, state-segment, ingest-state with GSI_ACTIVE_UPLOADS) + S3 pipeline bucket; math constants live client-side in SwiftData settings"
     must:
-      - "Preserve Retention/UpdateReplacePolicy Retain on all stateful tables"
-      - "Include mandatory Owner/Project/Iteration tags across all resources"
+      - "Preserve DeletionPolicy/UpdateReplacePolicy Retain on all stateful tables and PipelineBucket"
+      - "Include mandatory Owner/Project/Iteration tags across all taggable resources"
       - "Keep Primary Keys aligned with database_schema_plan.md literals (recording_id, cycle_id, segment_id)"
     ref:
       - at: ../AIMLC4_Playground/docs/database_schema_plan.md
@@ -48,6 +48,15 @@ Parameters:
       - "true"
       - "false"
     Description: Enable DynamoDB continuous point-in-time recovery backups.
+
+  PipelineBucketName:
+    Type: String
+    Default: ovius-pipeline-apse1-610331148578
+    AllowedPattern: "^[a-z0-9.-]+$"
+    MinLength: 3
+    MaxLength: 63
+    ConstraintDescription: PipelineBucketName must be a valid lowercase S3 bucket name (3-63 chars).
+    Description: S3 bucket name for video upload staging, checkpoints, Lambda artifacts, and Parquet lake.
 
 Resources:
   RecordingTable:
@@ -217,6 +226,152 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentName
 
+  IngestStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Orchestrates Phase 2 resumable multipart uploads, WORKER#LOCK leases, WebSocket subscriptions, and O(1) min(ETA) Batch keep-warm decisions via sparse GSI_ACTIVE_UPLOADS
+        must:
+          - "Keep GSI1SK numeric (N) so ascending ScanIndexForward=true orders upload_eta_s numerically without Limit=1 pre-filter hiding"
+          - "Keep StreamViewType NEW_IMAGE and TTL expires_at enabled"
+        mutable: change-with-constraints
+    Properties:
+      TableName: !Sub "${TablePrefix}-ingest-state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: N
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_ACTIVE_UPLOADS
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref EnablePointInTimeRecovery
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Central ap-southeast-3 S3 bucket for multipart video upload staging (uploads/), tracker checkpoints, Lambda artifacts (artifacts/), and Parquet analytics lake (parquet/)
+        must:
+          - "Preserve DeletionPolicy and UpdateReplacePolicy Retain"
+          - "Keep PublicAccessBlockConfiguration all-true and BucketOwnerEnforced"
+          - "Keep AbortIncompleteMultipartUpload=1d on uploads/ and CORS ExposedHeaders=[ETag]"
+        mutable: change-with-constraints
+    Properties:
+      BucketName: !Ref PipelineBucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: false
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads1Day
+            Status: Enabled
+            Prefix: uploads/
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionAnalyticsParquetToGlacier90Days
+            Status: Enabled
+            Prefix: parquet/
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PipelineBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Enforce TLS-only access to the pipeline S3 bucket for uploads, artifacts, and analytics reads
+        must:
+          - "Deny all non-HTTPS requests via aws:SecureTransport=false"
+        mutable: change-with-constraints
+    Properties:
+      Bucket: !Ref PipelineBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt PipelineBucket.Arn
+              - !Sub "${PipelineBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
 Outputs:
   RecordingTableName:
     Description: Provisioned DynamoDB table name for recording metadata
@@ -241,3 +396,23 @@ Outputs:
   StateSegmentTableArn:
     Description: ARN of the state_segment DynamoDB table
     Value: !GetAtt StateSegmentTable.Arn
+
+  IngestStateTableName:
+    Description: Provisioned DynamoDB table name for Phase 2 upload/worker ingest state
+    Value: !Ref IngestStateTable
+
+  IngestStateTableArn:
+    Description: ARN of the ingest_state DynamoDB table
+    Value: !GetAtt IngestStateTable.Arn
+
+  IngestStateStreamArn:
+    Description: DynamoDB Stream ARN of the ingest_state table (NEW_IMAGE)
+    Value: !GetAtt IngestStateTable.StreamArn
+
+  PipelineBucketName:
+    Description: Provisioned S3 bucket name for video uploads, artifacts, and Parquet lake
+    Value: !Ref PipelineBucket
+
+  PipelineBucketArn:
+    Description: ARN of the pipeline S3 bucket
+    Value: !GetAtt PipelineBucket.Arn

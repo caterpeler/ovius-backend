@@ -32,8 +32,14 @@ CYCLE_SUMMARY_PROJECTION = (
 _DEFAULT_RESOURCE_CONFIG = Config(
     retries={"total_max_attempts": 10, "mode": "adaptive"},
 )
+_S3_PRESIGN_CONFIG = Config(
+    signature_version="s3v4",
+    s3={"addressing_style": "virtual"},
+    retries={"total_max_attempts": 10, "mode": "adaptive"},
+)
 
 _CACHED_DDB_RESOURCE: Any | None = None
+_CACHED_S3_CLIENT: Any | None = None
 
 
 def get_dynamodb_resource() -> Any:
@@ -47,6 +53,14 @@ def get_dynamodb_resource() -> Any:
             config=_DEFAULT_RESOURCE_CONFIG,
         )
     return _CACHED_DDB_RESOURCE
+
+
+def _get_repo_s3_client() -> Any:
+    global _CACHED_S3_CLIENT  # noqa: PLW0603
+    if _CACHED_S3_CLIENT is None:
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-southeast-3"
+        _CACHED_S3_CLIENT = boto3.client("s3", region_name=region, config=_S3_PRESIGN_CONFIG)
+    return _CACHED_S3_CLIENT
 
 
 def json_safe(value: Any) -> Any:
@@ -93,12 +107,24 @@ def _query_all_pages(table: Any, **kwargs: Any) -> list[dict[str, Any]]:
 class TelemetryRepository:
     """Pure data-access facade over ovius-recording, ovius-haul-cycle, and ovius-state-segment."""
 
-    def __init__(self, ddb_resource: Any | None = None) -> None:
+    def __init__(self, ddb_resource: Any | None = None, s3_client: Any | None = None) -> None:
         self._ddb = ddb_resource or get_dynamodb_resource()
+        self._s3 = s3_client
         rec_name, cyc_name, seg_name = _table_names()
         self.recording_table = self._ddb.Table(rec_name)
         self.haul_cycle_table = self._ddb.Table(cyc_name)
         self.state_segment_table = self._ddb.Table(seg_name)
+
+    def _presign_get(self, bucket: str, key: str, expires_in: int = 3600) -> str:
+        client = self._s3 or _get_repo_s3_client()
+        return str(
+            client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=expires_in,
+                HttpMethod="GET",
+            )
+        )
 
     def resolve_recordings(self, filters: QueryFilters) -> list[dict[str, Any]]:
         """Fetch raw recording items matching recording_id, camera_id*, and datetime range."""
@@ -663,46 +689,92 @@ class TelemetryRepository:
         }
 
     def list_bboxes_template(self, filters: QueryFilters) -> dict[str, Any]:
-        """Template endpoint returning future S3 bounding-box track pointers for matched recordings."""
+        """Return S3 Parquet bounding-box track pointers and pre-signed URLs for matched recordings."""
         page = self.list_recordings_page(filters)
-        bucket = os.environ.get("ANALYTICS_S3_BUCKET", "ovius-cctv-analytics-apse3")
-        items = [
-            {
-                "recording_id": rec["recording_id"],
-                "camera_id": rec.get("camera_id"),
-                "timestamp": rec.get("timestamp"),
-                "bbox_artifact_uri": f"s3://{bucket}/bboxes/{rec['recording_id']}.parquet",
-                "presigned_url": None,
-            }
-            for rec in page["recordings"]
-        ]
+        bucket = (
+            os.environ.get("PIPELINE_S3_BUCKET")
+            or os.environ.get("ANALYTICS_S3_BUCKET")
+            or "ovius-pipeline-apse3-610331148578"
+        )
+        items: list[dict[str, Any]] = []
+        for rec in page["recordings"]:
+            parquet_keys = rec.get("parquet_keys") or []
+            chunk_parquet_uris = [
+                {
+                    "chunk_index": idx,
+                    "s3_key": str(pq_key),
+                    "bbox_artifact_uri": f"s3://{bucket}/{pq_key}",
+                    "presigned_url": self._presign_get(bucket, str(pq_key)),
+                }
+                for idx, pq_key in enumerate(parquet_keys)
+            ]
+            if chunk_parquet_uris:
+                bbox_uri = chunk_parquet_uris[0]["bbox_artifact_uri"]
+                presigned = chunk_parquet_uris[0]["presigned_url"]
+            else:
+                bbox_uri = f"s3://{bucket}/bboxes/{rec['recording_id']}.parquet"
+                presigned = None
+            items.append(
+                {
+                    "recording_id": rec["recording_id"],
+                    "camera_id": rec.get("camera_id"),
+                    "timestamp": rec.get("timestamp"),
+                    "bbox_artifact_uri": bbox_uri,
+                    "presigned_url": presigned,
+                    "chunk_parquet_uris": chunk_parquet_uris,
+                }
+            )
+        has_live_artifacts = any(bool(it.get("presigned_url")) for it in items)
         return {
             "query_type": "bboxes",
-            "status": "template",
+            "status": "ready" if has_live_artifacts else "template",
             "items": items,
             "pagination": page["pagination"],
         }
 
     def list_videos_template(self, filters: QueryFilters) -> dict[str, Any]:
-        """Template endpoint returning future CloudFront video stream pointers for matched recordings."""
+        """Return video stream pointers and pre-signed per-chunk S3 URLs for multi-chunk scrubbing."""
         page = self.list_recordings_page(filters)
-        items = [
-            {
-                "recording_id": rec["recording_id"],
-                "camera_id": rec.get("camera_id"),
-                "filename": rec.get("filename"),
-                "timestamp": rec.get("timestamp"),
-                "duration_s": rec.get("duration_s"),
-                "fps": rec.get("fps"),
-                "resolution": rec.get("resolution"),
-                "stream_url": f"/videos/{rec.get('camera_id')}/{rec.get('filename')}",
-                "signed_cookies_required": True,
-            }
-            for rec in page["recordings"]
-        ]
+        bucket = (
+            os.environ.get("PIPELINE_S3_BUCKET")
+            or os.environ.get("ANALYTICS_S3_BUCKET")
+            or "ovius-pipeline-apse3-610331148578"
+        )
+        items: list[dict[str, Any]] = []
+        for rec in page["recordings"]:
+            raw_chunks = sorted(
+                rec.get("chunk_keys") or [],
+                key=lambda c: int(c.get("chunk_index", 0)),
+            )
+            chunks_out = [
+                {
+                    "chunk_index": int(ch["chunk_index"]),
+                    "s3_key": str(ch["s3_key"]),
+                    "start_offset_s": ch.get("start_offset_s", 0),
+                    "duration_s": ch.get("duration_s", 3600),
+                    "presigned_url": self._presign_get(bucket, str(ch["s3_key"])),
+                }
+                for ch in raw_chunks
+                if ch.get("s3_key")
+            ]
+            items.append(
+                {
+                    "recording_id": rec["recording_id"],
+                    "camera_id": rec.get("camera_id"),
+                    "filename": rec.get("filename"),
+                    "timestamp": rec.get("timestamp"),
+                    "duration_s": rec.get("duration_s"),
+                    "fps": rec.get("fps"),
+                    "resolution": rec.get("resolution"),
+                    "stream_url": f"/videos/{rec.get('camera_id')}/{rec.get('filename')}",
+                    "signed_cookies_required": not bool(chunks_out),
+                    "chunks": chunks_out,
+                }
+            )
+        has_live_videos = any(bool(it.get("chunks")) for it in items)
         return {
             "query_type": "videos",
-            "status": "template",
+            "status": "ready" if has_live_videos else "template",
             "items": items,
             "pagination": page["pagination"],
         }

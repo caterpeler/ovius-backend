@@ -211,8 +211,8 @@ def parse_query_filters(
         # Deduplicate while preserving deterministic order
         camera_ids = tuple(dict.fromkeys(raw_cameras))
 
-    raw_start = _extract_single(event, "start_time")
-    raw_end = _extract_single(event, "end_time")
+    raw_start = _extract_single(event, "start_time") or _extract_single(event, "start_date")
+    raw_end = _extract_single(event, "end_time") or _extract_single(event, "end_date")
 
     start_iso: str | None
     end_iso: str | None

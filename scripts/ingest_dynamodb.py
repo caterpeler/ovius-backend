@@ -7,7 +7,7 @@ supports atomic line-watermark checkpoints for safe resumption.
 
 Run:
   uv run --python 3.11 --with boto3 python3 scripts/ingest_dynamodb.py \
-    --profile 610331148578_Project8Learner --region ap-southeast-3 --table-prefix ovius
+    --profile 610331148578_Project8Learner --region ap-southeast-1 --table-prefix ovius
 """
 from __future__ import annotations
 
@@ -387,7 +387,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Stream-ingest DynamoDB JSONL seed items into AWS DynamoDB tables.")
     parser.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL, help="Path to dynamodb_items.jsonl")
     parser.add_argument("--profile", default="610331148578_Project8Learner", help="AWS CLI/SDK profile name")
-    parser.add_argument("--region", default="ap-southeast-3", help="Target AWS region")
+    parser.add_argument("--region", default="ap-southeast-1", help="Target AWS region")
     parser.add_argument("--table-prefix", default="ovius", help="Table name prefix matching CloudFormation stack")
     parser.add_argument("--workers", type=int, default=16, help="Concurrent BatchWriteItem worker threads")
     parser.add_argument(

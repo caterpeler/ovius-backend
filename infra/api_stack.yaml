@@ -58,8 +58,8 @@ Parameters:
 
   AnalyticsBucketName:
     Type: String
-    Default: ovius-cctv-analytics-apse3
-    Description: Placeholder S3 bucket name echoed in /api/v1/bboxes template responses.
+    Default: ovius-pipeline-apse1-610331148578
+    Description: S3 bucket name echoed in /api/v1/bboxes template responses.
 
   LambdaCodeS3Bucket:
     Type: String
@@ -80,6 +80,19 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional pre-provisioned IAM role ARN for the Lambda function (used in sandboxed accounts without iam:CreateRole).
+
+  WorkerInstanceId:
+    Type: String
+    Default: ""
+    Description: Optional persistent GPU EC2 worker instance ID woken on READY recording transition.
+
+  EnableAutoEc2Start:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: Toggle automatic ec2:StartInstances on WorkerInstanceId when recordings become READY.
 
 Conditions:
   ApiKeyRequiredCond: !Equals [!Ref RequireApiKey, "true"]
@@ -168,6 +181,45 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-haul-cycle/index/*"
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-state-segment"
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-state-segment/index/*"
+        - PolicyName: DynamoDBIngestStateReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-ingest-state"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-ingest-state/index/*"
+        - PolicyName: S3MultipartUploadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${AnalyticsBucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/*"
+        - PolicyName: SQSReadyQueueSend
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueUrl
+                  - sqs:SendMessage
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${TablePrefix}-ready-recordings"
       Tags:
         - Key: Owner
           Value: project8
@@ -208,7 +260,15 @@ Resources:
           RECORDING_TABLE: !Sub "${TablePrefix}-recording"
           HAUL_CYCLE_TABLE: !Sub "${TablePrefix}-haul-cycle"
           STATE_SEGMENT_TABLE: !Sub "${TablePrefix}-state-segment"
+          INGEST_STATE_TABLE: !Sub "${TablePrefix}-ingest-state"
+          PIPELINE_S3_BUCKET: !Ref AnalyticsBucketName
           ANALYTICS_S3_BUCKET: !Ref AnalyticsBucketName
+          READY_QUEUE_NAME: !Sub "${TablePrefix}-ready-recordings"
+          BATCH_JOB_QUEUE: !Sub "${TablePrefix}-gpu-job-queue"
+          BATCH_JOB_DEFINITION: !Sub "${TablePrefix}-vision-worker-job"
+          AUTO_SUBMIT_BATCH_JOBS: "false"
+          WORKER_INSTANCE_ID: !Ref WorkerInstanceId
+          AUTO_START_EC2_WORKER: !Ref EnableAutoEc2Start
       Code:
         S3Bucket: !If [UseS3CodeCond, !Ref LambdaCodeS3Bucket, !Ref "AWS::NoValue"]
         S3Key: !If [UseS3CodeCond, !Ref LambdaCodeS3Key, !Ref "AWS::NoValue"]
@@ -291,6 +351,32 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OviusDataApiFunction.Arn}/invocations"
 
+  ApiV1ProxyPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResourceId: !Ref ApiV1ProxyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [ApiKeyRequiredCond, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OviusDataApiFunction.Arn}/invocations"
+
+  ApiV1ProxyPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OviusRestApi
+      ResourceId: !Ref ApiV1ProxyResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [ApiKeyRequiredCond, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OviusDataApiFunction.Arn}/invocations"
+
   ApiV1ProxyOptionsMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -308,7 +394,7 @@ Resources:
           - StatusCode: "204"
             ResponseParameters:
               method.response.header.Access-Control-Allow-Origin: "'*'"
-              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,OPTIONS'"
               method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
       MethodResponses:
         - StatusCode: "204"
@@ -341,12 +427,14 @@ Resources:
       FunctionName: !Ref OviusDataApiFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OviusRestApi}/*/GET/api/v1/*"
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OviusRestApi}/*/*/api/v1/*"
 
-  OviusApiDeployment:
+  OviusApiDeploymentV2:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - ApiV1ProxyGetMethod
+      - ApiV1ProxyPostMethod
+      - ApiV1ProxyPutMethod
       - ApiV1ProxyOptionsMethod
       - OviusGatewayResponse4XX
       - OviusGatewayResponse5XX
@@ -359,7 +447,7 @@ Resources:
     Properties:
       StageName: !Ref ApiStageName
       RestApiId: !Ref OviusRestApi
-      DeploymentId: !Ref OviusApiDeployment
+      DeploymentId: !Ref OviusApiDeploymentV2
       MethodSettings:
         - ResourcePath: "/*"
           HttpMethod: "*"
@@ -455,6 +543,10 @@ Resources:
             - GET
             - HEAD
             - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
           CachedMethods:
             - GET
             - HEAD
@@ -470,6 +562,10 @@ Resources:
               - GET
               - HEAD
               - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
             CachedMethods:
               - GET
               - HEAD

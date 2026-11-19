@@ -1,0 +1,849 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Provision Phase 2 Ovius ingest orchestration and GPU Batch compute (SQS
+  ready-recordings queue + DLQ, S3 Gateway VPC Endpoint, ECR repository, AWS
+  Batch g4dn.4xlarge minvCpus=0 compute with CloudWatch GPU agent, S3 fallback,
+  and 5-minute stale upload watchdog).
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: "aws-cloudformation@3"
+  com.aws.cloudformation.Context:
+    arch: "EventBridge S3 fallback + 5m Watchdog Lambda -> SQS (VisTimeout=900s) -> AWS Batch Managed EC2 GPU (g4dn.4xlarge minvCpus=0) over free S3 Gateway VPC Endpoint"
+    must:
+      - "Keep EBS volume <= 100 GB per LearnerLimits EC2SmallVolumesOnly"
+      - "Include mandatory Owner/Project/Iteration tags on all resources (map format for AWS::Batch::*, list format elsewhere)"
+      - "Use pre-provisioned Project8* IAM roles since iam:CreateRole is Admin-only"
+    ref:
+      - at: ../AIMLC4_Playground/docs/aws_architecture_plan.md
+        has: Phase 2 AWS Batch keep-warm, S3 Gateway VPC Endpoint, SQS, and Watchdog specification
+        scope: architecture
+      - at: AGENTS.md
+        has: Account 610331148578 tagging and ap-southeast-1 infrastructure boundaries
+        scope: guardrails
+    owner: project8
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment tag.
+
+  TablePrefix:
+    Type: String
+    Default: ovius
+    AllowedPattern: "^[a-z0-9-]+$"
+    MinLength: 2
+    MaxLength: 32
+    ConstraintDescription: TablePrefix must contain only lowercase letters, numbers, and hyphens.
+    Description: Prefix applied to DynamoDB tables, SQS queues, ECR repo, and Batch resources.
+
+  PipelineBucketName:
+    Type: String
+    Default: ovius-pipeline-apse1-610331148578
+    AllowedPattern: "^[a-z0-9.-]+$"
+    MinLength: 3
+    MaxLength: 63
+    Description: S3 bucket storing uploaded video chunks, checkpoints, and Parquet analytics.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-059c4cc3aaceafcfd
+    Description: Target VPC ID for AWS Batch GPU workers and S3 Gateway VPC Endpoint.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: "subnet-09024caaeca78fc51,subnet-0c08c08e158d621ff,subnet-08c412192d036fdcf"
+    Description: Subnets across ap-southeast-1a/b/c for AWS Batch GPU instances.
+
+  RouteTableId:
+    Type: String
+    Default: rtb-020e968b674306ed6
+    AllowedPattern: "^rtb-[a-f0-9]+$"
+    Description: Route table ID associated with the Batch subnets for free S3 Gateway VPC Endpoint routing.
+
+  BatchInstanceType:
+    Type: String
+    Default: g4dn.4xlarge
+    AllowedValues:
+      - g4dn.4xlarge
+      - g5.4xlarge
+    Description: GPU EC2 instance type for AWS Batch inference workers.
+
+  BatchMaxvCpus:
+    Type: Number
+    Default: 16
+    MinValue: 0
+    MaxValue: 64
+    Description: Maximum vCPU cap for the AWS Batch Managed EC2 compute environment.
+
+  EbsVolumeSizeGb:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 100
+    Description: Root EBS gp3 volume size in GiB (must remain <= 100 GB per LearnerLimits).
+
+  EnableAutoBatchSubmit:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: Toggle automatic batch:SubmitJob from orchestrator/upload transitions (keep false until worker image is pushed).
+
+  EnableBatchCompute:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Provision ECR + AWS Batch GPU compute resources (set false for persistent single-EC2 worker regions like ap-southeast-3).
+
+  WorkerInstanceId:
+    Type: String
+    Default: ""
+    Description: Optional persistent GPU EC2 worker instance ID woken by EventBridge fallback and 5-minute watchdog.
+
+  EnableAutoEc2Start:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: Toggle automatic ec2:StartInstances on WorkerInstanceId when recordings are queued in SQS.
+
+  WorkerImageUri:
+    Type: String
+    Default: ""
+    Description: Optional container image URI for AWS Batch job definition (defaults to ECR repository latest tag).
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket containing packaged ovius_api Lambda zip artifact.
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: ""
+    Description: Optional S3 object key for packaged ovius_api Lambda zip artifact.
+
+  LambdaExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::610331148578:role/Project8LambdaExecutionRole
+    Description: Pre-provisioned IAM role ARN for Lambda execution.
+
+  BatchInstanceProfileArn:
+    Type: String
+    Default: arn:aws:iam::610331148578:instance-profile/Project8BatchInstanceRole
+    Description: Pre-provisioned EC2 instance profile ARN for AWS Batch GPU hosts.
+
+  BatchExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::610331148578:role/Project8EcsTaskExecutionRole
+    Description: Pre-provisioned ECS task execution role ARN for ECR pulls and awslogs.
+
+  BatchJobRoleArn:
+    Type: String
+    Default: arn:aws:iam::610331148578:role/Project8BatchJobRole
+    Description: Pre-provisioned AWS Batch job IAM role ARN for S3, SQS, and DynamoDB access.
+
+  IngestStateStreamArn:
+    Type: String
+    Default: ""
+    Description: Optional DynamoDB Stream ARN from ovius-ingest-state for filtered WebSocket progress pushes.
+
+Conditions:
+  UseS3CodeCond: !Not [!Equals [!Ref LambdaCodeS3Bucket, ""]]
+  HasWorkerImageCond: !Not [!Equals [!Ref WorkerImageUri, ""]]
+  HasIngestStreamCond: !Not [!Equals [!Ref IngestStateStreamArn, ""]]
+  CreateBatchCond: !Equals [!Ref EnableBatchCompute, "true"]
+
+Resources:
+  OviusReadyRecordingsDlq:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Dead-letter queue capturing recordings that exceed 5 SQS delivery retries without completing
+        must:
+          - "Keep SqsManagedSseEnabled true and DeletionPolicy Retain"
+        mutable: change-with-constraints
+    Properties:
+      QueueName: !Sub "${TablePrefix}-ready-recordings-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusReadyRecordingsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Primary ready-recording queue consumed by GPU workers with 15-minute VisibilityTimeout renewed every 5 minutes
+        must:
+          - "Keep VisibilityTimeout=900s so crashed workers recover within 15m without 12h starvation"
+          - "Keep SqsManagedSseEnabled true and RedrivePolicy pointing to DLQ"
+        mutable: change-with-constraints
+    Properties:
+      QueueName: !Sub "${TablePrefix}-ready-recordings"
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OviusReadyRecordingsDlq.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusS3GatewayVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Free Gateway VPC Endpoint routing S3 chunk downloads over AWS backbone at up to 25 Gbps ($0/GB vs NAT fees)
+        must:
+          - "Keep attached to Batch subnet route table rtb-020e968b674306ed6"
+        mutable: change-with-constraints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTableId
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusWorkerEcrRepository:
+    Type: AWS::ECR::Repository
+    Condition: CreateBatchCond
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Private ECR repository for the DEIM-D-FINE + ByteTrack + Keep-Warm GPU inference container image
+        must:
+          - "Keep ScanOnPush enabled and AES256 encryption"
+        mutable: change-with-constraints
+    Properties:
+      RepositoryName: !Sub "${TablePrefix}-vision-worker"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusBatchWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateBatchCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Egress-only security group for AWS Batch GPU hosts; zero inbound ports exposed
+        must:
+          - "Never add public ingress rules (0.0.0.0/0)"
+        mutable: change-with-constraints
+    Properties:
+      GroupDescription: Egress-only security group for Ovius AWS Batch GPU vision workers
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS/DNS/AWS service traffic from GPU worker
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-batch-worker-sg"
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusBatchGpuLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateBatchCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Enforces <=100 GB encrypted gp3 root EBS volume, IMDSv2, Project8 tags, and CloudWatch GPU Agent bootstrap on Batch EC2 hosts
+        must:
+          - "Keep EBS VolumeSize <= 100 GB (EC2SmallVolumesOnly) and DeviceName /dev/xvda matching ECS GPU AMI"
+          - "Keep HttpTokens=required (IMDSv2) and Owner=project8 TagSpecifications on instance and volume"
+        mutable: change-with-constraints
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-gpu-lt"
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref EbsVolumeSizeGb
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-gpu-worker"
+              - Key: Owner
+                Value: project8
+              - Key: Project
+                Value: AIMLC4
+              - Key: Iteration
+                Value: v5
+              - Key: Environment
+                Value: !Ref EnvironmentName
+          - ResourceType: volume
+            Tags:
+              - Key: Owner
+                Value: project8
+              - Key: Project
+                Value: AIMLC4
+              - Key: Iteration
+                Value: v5
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        UserData:
+          Fn::Base64: !Sub |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            set -euxo pipefail
+            if ! command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1; then
+              if command -v dnf >/dev/null 2>&1; then
+                dnf install -y amazon-cloudwatch-agent || true
+              else
+                yum install -y amazon-cloudwatch-agent || true
+              fi
+            fi
+            mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+            cat <<'CWCFG' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            {
+              "agent": {
+                "metrics_collection_interval": 60,
+                "run_as_user": "root"
+              },
+              "metrics": {
+                "namespace": "Ovius/BatchHost",
+                "append_dimensions": {
+                  "InstanceId": "${!aws:InstanceId}",
+                  "InstanceType": "${!aws:InstanceType}"
+                },
+                "metrics_collected": {
+                  "nvidia_gpu": {
+                    "measurement": [
+                      "utilization_gpu",
+                      "utilization_memory",
+                      "memory_used",
+                      "memory_total",
+                      "temperature_gpu",
+                      "power_draw"
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": ["used_percent"],
+                    "metrics_collection_interval": 60,
+                    "resources": ["/", "/tmp"]
+                  },
+                  "mem": {
+                    "measurement": ["mem_used_percent"],
+                    "metrics_collection_interval": 60
+                  },
+                  "cpu": {
+                    "measurement": ["cpu_usage_iowait"],
+                    "metrics_collection_interval": 60
+                  }
+                }
+              }
+            }
+            CWCFG
+            if command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1; then
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
+            fi
+
+            --==BOUNDARY==--
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Owner
+              Value: project8
+            - Key: Project
+              Value: AIMLC4
+            - Key: Iteration
+              Value: v5
+            - Key: Environment
+              Value: !Ref EnvironmentName
+
+  OviusBatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Condition: CreateBatchCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Managed EC2 On-Demand GPU compute scaling from minvCpus=0 ($0 idle) to g4dn.4xlarge in ap-southeast-1a/b/c
+        must:
+          - "Keep MinvCpus=0 and BEST_FIT_PROGRESSIVE On-Demand to avoid Spot 2m evictions"
+          - "Keep LaunchTemplate attached to enforce <=100 GB EBS and CloudWatch GPU Agent"
+        mutable: change-with-constraints
+    Properties:
+      ComputeEnvironmentName: !Sub "${TablePrefix}-gpu-compute-env"
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        MinvCpus: 0
+        DesiredvCpus: 0
+        MaxvCpus: !Ref BatchMaxvCpus
+        InstanceTypes:
+          - !Ref BatchInstanceType
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds:
+          - !GetAtt OviusBatchWorkerSecurityGroup.GroupId
+        InstanceRole: !Ref BatchInstanceProfileArn
+        Ec2Configuration:
+          - ImageType: ECS_AL2023_NVIDIA
+        LaunchTemplate:
+          LaunchTemplateId: !Ref OviusBatchGpuLaunchTemplate
+          Version: !GetAtt OviusBatchGpuLaunchTemplate.LatestVersionNumber
+        Tags:
+          Owner: project8
+          Project: AIMLC4
+          Iteration: v5
+          Environment: !Ref EnvironmentName
+      Tags:
+        Owner: project8
+        Project: AIMLC4
+        Iteration: v5
+        Environment: !Ref EnvironmentName
+
+  OviusBatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Condition: CreateBatchCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Single GPU job queue dispatching vision inference jobs onto OviusBatchComputeEnvironment
+        must:
+          - "Maintain ComputeEnvironmentOrder pointing to OviusBatchComputeEnvironment"
+        mutable: change-with-constraints
+    Properties:
+      JobQueueName: !Sub "${TablePrefix}-gpu-job-queue"
+      Priority: 1
+      State: ENABLED
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref OviusBatchComputeEnvironment
+      Tags:
+        Owner: project8
+        Project: AIMLC4
+        Iteration: v5
+        Environment: !Ref EnvironmentName
+
+  OviusBatchWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateBatchCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudWatch log group receiving worker stdout including single-line CloudWatch EMF metrics
+        must:
+          - "Keep 30-day retention for EMF log metric extraction"
+        mutable: free-to-tune
+    Properties:
+      LogGroupName: !Sub "/aws/batch/${TablePrefix}-vision-worker"
+      RetentionInDays: 30
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusBatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Condition: CreateBatchCond
+    DependsOn: OviusBatchWorkerLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Container job definition allocating 1 GPU, 4 vCPUs, 16 GiB RAM on g4dn.4xlarge with awslogs EMF delivery
+        must:
+          - "Use pre-provisioned Project8EcsTaskExecutionRole and Project8BatchJobRole"
+        mutable: change-with-constraints
+    Properties:
+      JobDefinitionName: !Sub "${TablePrefix}-vision-worker-job"
+      Type: container
+      PlatformCapabilities:
+        - EC2
+      PropagateTags: true
+      RetryStrategy:
+        Attempts: 2
+      Timeout:
+        AttemptDurationSeconds: 21600
+      ContainerProperties:
+        Image: !If
+          - HasWorkerImageCond
+          - !Ref WorkerImageUri
+          - !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${OviusWorkerEcrRepository}:latest"
+        ExecutionRoleArn: !Ref BatchExecutionRoleArn
+        JobRoleArn: !Ref BatchJobRoleArn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "4"
+          - Type: MEMORY
+            Value: "16384"
+          - Type: GPU
+            Value: "1"
+        Environment:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: RECORDING_TABLE
+            Value: !Sub "${TablePrefix}-recording"
+          - Name: HAUL_CYCLE_TABLE
+            Value: !Sub "${TablePrefix}-haul-cycle"
+          - Name: STATE_SEGMENT_TABLE
+            Value: !Sub "${TablePrefix}-state-segment"
+          - Name: INGEST_STATE_TABLE
+            Value: !Sub "${TablePrefix}-ingest-state"
+          - Name: PIPELINE_S3_BUCKET
+            Value: !Ref PipelineBucketName
+          - Name: READY_QUEUE_URL
+            Value: !Ref OviusReadyRecordingsQueue
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref OviusBatchWorkerLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: worker
+      Tags:
+        Owner: project8
+        Project: AIMLC4
+        Iteration: v5
+        Environment: !Ref EnvironmentName
+
+  OviusIngestOrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-orchestrator"
+      RetentionInDays: 30
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusIngestOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OviusIngestOrchestratorLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: EventBridge Lambda handling S3 Object Created fallback completions and 5-minute stale upload sweeps
+        must:
+          - "Use pre-provisioned Project8LambdaExecutionRole and keep stale sweep Limit=1-free on GSI_ACTIVE_UPLOADS"
+        mutable: change-with-constraints
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-orchestrator"
+      Description: EventBridge fallback handler for S3 Object Created and 5m stale upload watchdog sweeps.
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      Handler: ovius_api.orchestrator.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      MemorySize: 256
+      Timeout: 60
+      TracingConfig:
+        Mode: PassThrough
+      Environment:
+        Variables:
+          INGEST_STATE_TABLE: !Sub "${TablePrefix}-ingest-state"
+          PIPELINE_S3_BUCKET: !Ref PipelineBucketName
+          READY_QUEUE_URL: !Ref OviusReadyRecordingsQueue
+          READY_QUEUE_NAME: !Sub "${TablePrefix}-ready-recordings"
+          BATCH_JOB_QUEUE: !If [CreateBatchCond, !Ref OviusBatchJobQueue, ""]
+          BATCH_JOB_DEFINITION: !If [CreateBatchCond, !Ref OviusBatchJobDefinition, ""]
+          AUTO_SUBMIT_BATCH_JOBS: !Ref EnableAutoBatchSubmit
+          WORKER_INSTANCE_ID: !Ref WorkerInstanceId
+          AUTO_START_EC2_WORKER: !Ref EnableAutoEc2Start
+          STALE_UPLOAD_TIMEOUT_S: "900"
+      Code:
+        S3Bucket: !If [UseS3CodeCond, !Ref LambdaCodeS3Bucket, !Ref "AWS::NoValue"]
+        S3Key: !If [UseS3CodeCond, !Ref LambdaCodeS3Key, !Ref "AWS::NoValue"]
+        ZipFile: !If
+          - UseS3CodeCond
+          - !Ref "AWS::NoValue"
+          - |
+            import json
+            def lambda_handler(event, context):
+                return {"statusCode": 503, "body": json.dumps({"error": "Package not deployed via S3 yet"})}
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusS3UploadFallbackRule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Fallback EventBridge rule catching S3 chunk_XX.mp4 Object Created events if /chunks/complete client response drops
+        must:
+          - "Filter strictly to PipelineBucketName and uploads/ prefix"
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub "${AWS::StackName}-s3-upload-fallback"
+      Description: Route S3 Object Created events under uploads/ to OviusIngestOrchestratorFunction.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref PipelineBucketName
+          object:
+            key:
+              - prefix: uploads/
+      Targets:
+        - Id: S3UploadFallbackTarget
+          Arn: !GetAtt OviusIngestOrchestratorFunction.Arn
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusS3UploadFallbackPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OviusIngestOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OviusS3UploadFallbackRule.Arn
+
+  OviusStaleUploadWatchdogRule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: 5-minute scheduled sweep evicting stale UPLOADING recordings (>15m) from GSI_ACTIVE_UPLOADS as STALLED
+        must:
+          - "Use AWS::Events::Rule + Lambda::Permission compatible with Project8LambdaExecutionRole"
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub "${AWS::StackName}-stale-watchdog"
+      Description: Trigger stale upload sweep every 5 minutes on ovius-ingest-state.
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: StaleUploadWatchdogTarget
+          Arn: !GetAtt OviusIngestOrchestratorFunction.Arn
+          Input: '{"action":"stale_watchdog","stale_after_s":900}'
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusStaleUploadWatchdogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OviusIngestOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OviusStaleUploadWatchdogRule.Arn
+
+  OviusProgressBroadcasterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-progress-broadcaster"
+      RetentionInDays: 30
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusProgressBroadcasterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OviusProgressBroadcasterLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Filtered DynamoDB Stream broadcaster pushing SESSION#*/REC#* and META progress to WebSocket clients
+        must:
+          - "Attach FilterCriteria on SK prefix REC# and equals META so CHUNK# and WORKER#LOCK churn never invoke Lambda"
+        mutable: change-with-constraints
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-progress-broadcaster"
+      Description: Filtered ovius-ingest-state DynamoDB Stream WebSocket progress broadcaster.
+      Runtime: python3.11
+      Architectures:
+        - arm64
+      Handler: ovius_api.broadcaster.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      MemorySize: 256
+      Timeout: 30
+      TracingConfig:
+        Mode: PassThrough
+      Environment:
+        Variables:
+          INGEST_STATE_TABLE: !Sub "${TablePrefix}-ingest-state"
+      Code:
+        S3Bucket: !If [UseS3CodeCond, !Ref LambdaCodeS3Bucket, !Ref "AWS::NoValue"]
+        S3Key: !If [UseS3CodeCond, !Ref LambdaCodeS3Key, !Ref "AWS::NoValue"]
+        ZipFile: !If
+          - UseS3CodeCond
+          - !Ref "AWS::NoValue"
+          - |
+            import json
+            def lambda_handler(event, context):
+                return {"statusCode": 503, "body": json.dumps({"error": "Package not deployed via S3 yet"})}
+      Tags:
+        - Key: Owner
+          Value: project8
+        - Key: Project
+          Value: AIMLC4
+        - Key: Iteration
+          Value: v5
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OviusIngestStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasIngestStreamCond
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Filtered DynamoDB Stream ESM delivering only REC# and META mutations to ProgressBroadcasterFunction
+        must:
+          - "Keep FilterCriteria scoped to sk prefix REC# or equals META"
+        mutable: change-with-constraints
+    Properties:
+      BatchSize: 25
+      Enabled: true
+      EventSourceArn: !Ref IngestStateStreamArn
+      FunctionName: !GetAtt OviusProgressBroadcasterFunction.Arn
+      StartingPosition: LATEST
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"dynamodb":{"Keys":{"sk":{"S":[{"prefix":"REC#"},"META"]}}}}'
+
+Outputs:
+  ReadyQueueUrl:
+    Description: URL of the primary SQS queue for READY recordings
+    Value: !Ref OviusReadyRecordingsQueue
+
+  ReadyQueueArn:
+    Description: ARN of the primary SQS queue for READY recordings
+    Value: !GetAtt OviusReadyRecordingsQueue.Arn
+
+  ReadyDlqUrl:
+    Description: URL of the dead-letter queue for failed ready-recording processing
+    Value: !Ref OviusReadyRecordingsDlq
+
+  S3VpcEndpointId:
+    Description: Gateway VPC Endpoint ID for zero-NAT S3 access from Batch GPU workers
+    Value: !Ref OviusS3GatewayVpcEndpoint
+
+  WorkerEcrRepositoryUri:
+    Condition: CreateBatchCond
+    Description: ECR repository URI for the DEIM-D-FINE GPU inference worker container
+    Value: !GetAtt OviusWorkerEcrRepository.RepositoryUri
+
+  BatchComputeEnvironmentArn:
+    Condition: CreateBatchCond
+    Description: ARN of the Managed EC2 GPU AWS Batch compute environment
+    Value: !Ref OviusBatchComputeEnvironment
+
+  BatchJobQueueArn:
+    Condition: CreateBatchCond
+    Description: ARN of the AWS Batch GPU job queue
+    Value: !Ref OviusBatchJobQueue
+
+  BatchJobDefinitionArn:
+    Condition: CreateBatchCond
+    Description: ARN of the AWS Batch GPU worker job definition
+    Value: !Ref OviusBatchJobDefinition
+
+  OrchestratorFunctionName:
+    Description: Name of the ingest orchestrator Lambda function
+    Value: !Ref OviusIngestOrchestratorFunction
+
+  OrchestratorFunctionArn:
+    Description: ARN of the ingest orchestrator Lambda function
+    Value: !GetAtt OviusIngestOrchestratorFunction.Arn
+
+  ProgressBroadcasterFunctionName:
+    Description: Name of the filtered DynamoDB Stream progress broadcaster Lambda
+    Value: !Ref OviusProgressBroadcasterFunction
+
+  ProgressBroadcasterFunctionArn:
+    Description: ARN of the filtered DynamoDB Stream progress broadcaster Lambda
+    Value: !GetAtt OviusProgressBroadcasterFunction.Arn

@@ -154,7 +154,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Verify live Ovius API Gateway & CloudFront endpoints.")
     parser.add_argument("--stack-name", default="ovius-api-backend")
     parser.add_argument("--profile", default="610331148578_Project8Learner")
-    parser.add_argument("--region", default="ap-southeast-3")
+    parser.add_argument("--region", default="ap-southeast-1")
     args = parser.parse_args()
 
     cfg = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})

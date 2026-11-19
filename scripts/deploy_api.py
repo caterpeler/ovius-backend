@@ -21,9 +21,10 @@ TEMPLATE_PATH = ROOT / "infra" / "api_stack.yaml"
 
 DEFAULT_STACK_NAME = "ovius-api-backend"
 DEFAULT_PROFILE = "610331148578_Project8Learner"
-DEFAULT_REGION = "ap-southeast-3"
-DEFAULT_S3_BUCKET = "sagemaker-savio-p8-apse3"
+DEFAULT_REGION = "ap-southeast-1"
+DEFAULT_S3_BUCKET = "ovius-pipeline-apse1-610331148578"
 DEFAULT_S3_PREFIX = "artifacts/ovius_backend"
+DEFAULT_ANALYTICS_BUCKET = "ovius-pipeline-apse1-610331148578"
 DEFAULT_LAMBDA_ROLE_ARN = "arn:aws:iam::610331148578:role/Project8LambdaExecutionRole"
 
 
@@ -67,11 +68,20 @@ def main() -> int:
     parser.add_argument("--region", default=DEFAULT_REGION)
     parser.add_argument("--s3-bucket", default=DEFAULT_S3_BUCKET)
     parser.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
+    parser.add_argument("--analytics-bucket-name", default=DEFAULT_ANALYTICS_BUCKET)
     parser.add_argument("--table-prefix", default="ovius")
     parser.add_argument("--env", default="dev", choices=["dev", "staging", "prod"])
     parser.add_argument("--require-api-key", default="false", choices=["false", "true"])
     parser.add_argument("--lambda-role-arn", default=DEFAULT_LAMBDA_ROLE_ARN)
+    parser.add_argument("--worker-instance-id", default="")
+    parser.add_argument("--enable-auto-ec2-start", default="false", choices=["false", "true"])
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--detect-drift", action="store_true")
+    parser.add_argument(
+        "--force-stage-redeploy",
+        action="store_true",
+        help="Force an out-of-band API Gateway stage deployment (not needed for Lambda code updates).",
+    )
     args = parser.parse_args()
 
     cfg = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})
@@ -110,9 +120,12 @@ def main() -> int:
             {"ParameterKey": "EnvironmentName", "ParameterValue": args.env},
             {"ParameterKey": "TablePrefix", "ParameterValue": args.table_prefix},
             {"ParameterKey": "RequireApiKey", "ParameterValue": args.require_api_key},
+            {"ParameterKey": "AnalyticsBucketName", "ParameterValue": args.analytics_bucket_name},
             {"ParameterKey": "LambdaCodeS3Bucket", "ParameterValue": "" if args.validate_only else args.s3_bucket},
             {"ParameterKey": "LambdaCodeS3Key", "ParameterValue": "" if args.validate_only else s3_key},
             {"ParameterKey": "LambdaExecutionRoleArn", "ParameterValue": args.lambda_role_arn},
+            {"ParameterKey": "WorkerInstanceId", "ParameterValue": args.worker_instance_id},
+            {"ParameterKey": "EnableAutoEc2Start", "ParameterValue": args.enable_auto_ec2_start},
             {"ParameterKey": "DeploymentNonce", "ParameterValue": f"{args.env}-{sha12}"},
         ]
         tags = [
@@ -173,23 +186,30 @@ def main() -> int:
 
         stack = cfn.describe_stacks(StackName=args.stack_name)["Stacks"][0]
         outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
-        if exists and "RestApiId" in outputs:
+        if args.force_stage_redeploy and exists and "RestApiId" in outputs:
             apigw = session.client("apigateway", config=cfg)
             apigw.create_deployment(
                 restApiId=outputs["RestApiId"],
                 stageName="v1",
                 description=f"Stage rollout {sha12}",
             )
-        print(
-            json.dumps(
-                {
-                    "status": stack["StackStatus"],
-                    "s3_artifact": f"s3://{args.s3_bucket}/{s3_key}",
-                    "outputs": stack.get("Outputs", []),
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "status": stack["StackStatus"],
+            "s3_artifact": f"s3://{args.s3_bucket}/{s3_key}",
+            "outputs": stack.get("Outputs", []),
+        }
+        if args.detect_drift:
+            det_id = cfn.detect_stack_drift(StackName=args.stack_name)["StackDriftDetectionId"]
+            while True:
+                drift = cfn.describe_stack_drift_detection_status(StackDriftDetectionId=det_id)
+                if drift["DetectionStatus"] in {"DETECTION_COMPLETE", "DETECTION_FAILED"}:
+                    payload["drift"] = {
+                        "StackDriftStatus": drift.get("StackDriftStatus"),
+                        "DriftedStackResourceCount": drift.get("DriftedStackResourceCount"),
+                    }
+                    break
+                time.sleep(2)
+        print(json.dumps(payload, indent=2, default=str))
         return 0
     except ClientError as exc:
         print(f"AWS deployment error: {exc}", file=sys.stderr)

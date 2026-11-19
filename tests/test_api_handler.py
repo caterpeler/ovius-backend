@@ -155,6 +155,17 @@ def test_parse_filters_date_range_and_camera_wildcard() -> None:
     assert filters.tod_start_s == 0.0
     assert filters.tod_end_s == 43200.0
 
+    alias_filters = parse_query_filters(
+        {
+            "queryStringParameters": {
+                "start_date": "2026-11-01",
+                "end_date": "2026-11-15",
+            }
+        }
+    )
+    assert alias_filters.start_time == "2026-11-01T00:00:00+00:00"
+    assert alias_filters.end_time == "2026-11-15T23:59:59+00:00"
+
 
 def test_parse_filters_normalizes_z_and_multi_value_cameras() -> None:
     filters = parse_query_filters(
@@ -524,3 +535,55 @@ def test_efficiency_filters_projection_and_wave_parallel_truncation() -> None:
     # 5. limit > 15000 rejected cleanly
     with pytest.raises(FilterValidationError):
         parse_query_filters({"queryStringParameters": {"limit": "15001"}})
+
+
+def test_videos_and_bboxes_return_ready_when_live_artifacts_exist() -> None:
+    recs = [
+        {
+            "recording_id": "rec_live_01",
+            "camera_id": "CAM-ALPHA-01",
+            "filename": "live.mp4",
+            "timestamp": "2026-11-19T06:00:00+00:00",
+            "duration_s": Decimal("300.0"),
+            "fps": Decimal("24.0"),
+            "resolution": "1920x1080",
+            "chunk_keys": [
+                {
+                    "chunk_index": 0,
+                    "s3_key": "uploads/site/upl/rec_live_01/chunk_00.mp4",
+                    "start_offset_s": Decimal("0"),
+                    "duration_s": Decimal("300"),
+                }
+            ],
+            "parquet_keys": [
+                "parquet/year=2026/month=11/day=19/zone=CAM-ALPHA-01/rec_live_01_chunk_00.parquet"
+            ],
+        }
+    ]
+
+    class _FakeS3:
+        def generate_presigned_url(self, _op: str, *, Params: dict[str, Any], ExpiresIn: int, HttpMethod: str) -> str:
+            assert HttpMethod == "GET"
+            return f"https://{Params['Bucket']}.s3.ap-southeast-3.amazonaws.com/{Params['Key']}?exp={ExpiresIn}"
+
+    repo = TelemetryRepository(ddb_resource=_FakeDynamoResource(recs, {}, {}), s3_client=_FakeS3())
+
+    vid = json.loads(
+        lambda_handler(
+            {"httpMethod": "GET", "path": "/api/v1/videos", "queryStringParameters": {"recording_id": "rec_live_01"}},
+            repository=repo,
+        )["body"]
+    )
+    assert vid["status"] == "ready"
+    assert vid["items"][0]["signed_cookies_required"] is False
+    assert vid["items"][0]["chunks"][0]["presigned_url"].startswith("https://")
+
+    bbox = json.loads(
+        lambda_handler(
+            {"httpMethod": "GET", "path": "/api/v1/bboxes", "queryStringParameters": {"recording_id": "rec_live_01"}},
+            repository=repo,
+        )["body"]
+    )
+    assert bbox["status"] == "ready"
+    assert bbox["items"][0]["presigned_url"].startswith("https://")
+
