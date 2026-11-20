@@ -19,13 +19,13 @@ TEMPLATE_PATH = ROOT / "infra" / "dynamodb_tables.yaml"
 
 DEFAULT_STACK_NAME = "ovius-dynamodb-telemetry"
 DEFAULT_PROFILE = "610331148578_Project8Learner"
-DEFAULT_REGION = "ap-southeast-1"
-DEFAULT_PIPELINE_BUCKET = "ovius-pipeline-apse1-610331148578"
+DEFAULT_REGION = "ap-southeast-3"
+DEFAULT_PIPELINE_BUCKET = "ovius-pipeline-apse3-610331148578"
 
 _IMPORT_PARAM_BLOCK = """
   PipelineBucketName:
     Type: String
-    Default: ovius-pipeline-apse1-610331148578
+    Default: ovius-pipeline-apse3-610331148578
     AllowedPattern: "^[a-z0-9.-]+$"
     MinLength: 3
     MaxLength: 63

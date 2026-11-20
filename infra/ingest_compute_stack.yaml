@@ -19,7 +19,7 @@ Metadata:
         has: Phase 2 AWS Batch keep-warm, S3 Gateway VPC Endpoint, SQS, and Watchdog specification
         scope: architecture
       - at: AGENTS.md
-        has: Account 610331148578 tagging and ap-southeast-1 infrastructure boundaries
+        has: Account 610331148578 tagging and ap-southeast-3 infrastructure boundaries
         scope: guardrails
     owner: project8
 
@@ -44,7 +44,7 @@ Parameters:
 
   PipelineBucketName:
     Type: String
-    Default: ovius-pipeline-apse1-610331148578
+    Default: ovius-pipeline-apse3-610331148578
     AllowedPattern: "^[a-z0-9.-]+$"
     MinLength: 3
     MaxLength: 63
@@ -52,17 +52,17 @@ Parameters:
 
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Default: vpc-059c4cc3aaceafcfd
+    Default: vpc-04cbff2c12511037a
     Description: Target VPC ID for AWS Batch GPU workers and S3 Gateway VPC Endpoint.
 
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Default: "subnet-09024caaeca78fc51,subnet-0c08c08e158d621ff,subnet-08c412192d036fdcf"
-    Description: Subnets across ap-southeast-1a/b/c for AWS Batch GPU instances.
+    Default: "subnet-0610c0c53c7d9700a,subnet-0d9b24da3b46a67a1"
+    Description: Subnets across ap-southeast-3a/c for AWS Batch GPU instances.
 
   RouteTableId:
     Type: String
-    Default: rtb-020e968b674306ed6
+    Default: rtb-0ff92726d27caa8cf
     AllowedPattern: "^rtb-[a-f0-9]+$"
     Description: Route table ID associated with the Batch subnets for free S3 Gateway VPC Endpoint routing.
 
@@ -107,7 +107,7 @@ Parameters:
   WorkerInstanceId:
     Type: String
     Default: ""
-    Description: Optional persistent GPU EC2 worker instance ID woken by EventBridge fallback and 5-minute watchdog.
+    Description: Optional persistent GPU EC2 worker instance ID or comma-separated multi-AZ failover list woken by EventBridge fallback and 5-minute watchdog.
 
   EnableAutoEc2Start:
     Type: String
@@ -427,7 +427,7 @@ Resources:
     Condition: CreateBatchCond
     Metadata:
       com.aws.cloudformation.Context:
-        why: Managed EC2 On-Demand GPU compute scaling from minvCpus=0 ($0 idle) to g4dn.4xlarge in ap-southeast-1a/b/c
+        why: Managed EC2 On-Demand GPU compute scaling from minvCpus=0 ($0 idle) to g4dn.4xlarge in ap-southeast-3a/c
         must:
           - "Keep MinvCpus=0 and BEST_FIT_PROGRESSIVE On-Demand to avoid Spot 2m evictions"
           - "Keep LaunchTemplate attached to enforce <=100 GB EBS and CloudWatch GPU Agent"

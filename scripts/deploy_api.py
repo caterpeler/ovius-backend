@@ -21,10 +21,10 @@ TEMPLATE_PATH = ROOT / "infra" / "api_stack.yaml"
 
 DEFAULT_STACK_NAME = "ovius-api-backend"
 DEFAULT_PROFILE = "610331148578_Project8Learner"
-DEFAULT_REGION = "ap-southeast-1"
-DEFAULT_S3_BUCKET = "ovius-pipeline-apse1-610331148578"
+DEFAULT_REGION = "ap-southeast-3"
+DEFAULT_S3_BUCKET = "ovius-pipeline-apse3-610331148578"
 DEFAULT_S3_PREFIX = "artifacts/ovius_backend"
-DEFAULT_ANALYTICS_BUCKET = "ovius-pipeline-apse1-610331148578"
+DEFAULT_ANALYTICS_BUCKET = "ovius-pipeline-apse3-610331148578"
 DEFAULT_LAMBDA_ROLE_ARN = "arn:aws:iam::610331148578:role/Project8LambdaExecutionRole"
 
 

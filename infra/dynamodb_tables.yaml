@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Provision 4-table DynamoDB operational telemetry and Phase 2 ingest-state
-  schema plus the ap-southeast-1 pipeline S3 bucket with On-Demand billing,
+  schema plus the ap-southeast-3 pipeline S3 bucket with On-Demand billing,
   SSE, PITR, Retain policies, lifecycle rules, CORS, and TLS-only access.
 
 Metadata:
@@ -51,7 +51,7 @@ Parameters:
 
   PipelineBucketName:
     Type: String
-    Default: ovius-pipeline-apse1-610331148578
+    Default: ovius-pipeline-apse3-610331148578
     AllowedPattern: "^[a-z0-9.-]+$"
     MinLength: 3
     MaxLength: 63

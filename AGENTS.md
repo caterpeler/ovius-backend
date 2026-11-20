@@ -15,7 +15,7 @@ Welcome to **`ovius_backend`**, the dedicated repository for AWS CloudFormation 
 
 ## 2. AWS Target & Tagging Guardrails
 
-- **Active DynamoDB Account & Region:** Account `610331148578` (`--profile 610331148578_Project8Learner`), **Primary Region `ap-southeast-3` (Jakarta)** (all 3 stacks + persistent `g5.xlarge` GPU worker), with `ap-southeast-1` (Singapore) retained as secondary.
+- **Active DynamoDB Account & Region:** Account `610331148578` (`--profile 610331148578_Project8Learner`), **Sole Live Region `ap-southeast-3` (Jakarta)** (all 3 stacks + persistent `g5.xlarge` GPU worker; legacy `ap-southeast-1` stacks/tables/S3 removed).
 - **Mandatory Resource Tags:** Tag all provisioned AWS resources with:
   - `Owner: project8`
   - `Project: AIMLC4`

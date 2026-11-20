@@ -267,7 +267,7 @@ def main() -> int:
     parser.add_argument("--detect-drift", action="store_true")
     args = parser.parse_args()
 
-    region_defaults = REGION_NETWORK_DEFAULTS.get(args.region, REGION_NETWORK_DEFAULTS["ap-southeast-1"])
+    region_defaults = REGION_NETWORK_DEFAULTS.get(args.region, REGION_NETWORK_DEFAULTS["ap-southeast-3"])
     s3_bucket = args.s3_bucket or region_defaults["s3_bucket"]
     vpc_id = args.vpc_id or region_defaults["vpc_id"]
     subnet_ids = args.subnet_ids or region_defaults["subnet_ids"]

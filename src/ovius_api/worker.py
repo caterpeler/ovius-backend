@@ -427,7 +427,7 @@ class VisionWorkerRunner:
             bucket_name
             or os.environ.get("PIPELINE_S3_BUCKET")
             or os.environ.get("ANALYTICS_S3_BUCKET")
-            or "ovius-pipeline-apse1-610331148578"
+            or "ovius-pipeline-apse3-610331148578"
         )
         self.ready_queue_name = ready_queue_name or os.environ.get(
             "READY_QUEUE_NAME", "ovius-ready-recordings"

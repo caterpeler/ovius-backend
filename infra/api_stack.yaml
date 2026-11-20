@@ -58,7 +58,7 @@ Parameters:
 
   AnalyticsBucketName:
     Type: String
-    Default: ovius-pipeline-apse1-610331148578
+    Default: ovius-pipeline-apse3-610331148578
     Description: S3 bucket name echoed in /api/v1/bboxes template responses.
 
   LambdaCodeS3Bucket:
@@ -84,7 +84,7 @@ Parameters:
   WorkerInstanceId:
     Type: String
     Default: ""
-    Description: Optional persistent GPU EC2 worker instance ID woken on READY recording transition.
+    Description: Optional persistent GPU EC2 worker instance ID or comma-separated multi-AZ failover list woken on READY recording transition.
 
   EnableAutoEc2Start:
     Type: String

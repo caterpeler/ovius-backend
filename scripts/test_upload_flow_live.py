@@ -635,9 +635,9 @@ def main() -> int:
     parser.add_argument("--recording-table", default="ovius-recording")
     parser.add_argument("--cycle-table", default="ovius-haul-cycle")
     parser.add_argument("--segment-table", default="ovius-state-segment")
-    parser.add_argument("--bucket-name", default="ovius-pipeline-apse1-610331148578")
+    parser.add_argument("--bucket-name", default="ovius-pipeline-apse3-610331148578")
     parser.add_argument("--profile", default="610331148578_Project8Learner")
-    parser.add_argument("--region", default="ap-southeast-1")
+    parser.add_argument("--region", default="ap-southeast-3")
     args = parser.parse_args()
 
     cfg = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})

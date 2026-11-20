@@ -20,8 +20,8 @@ import torch
 import torch.nn as nn
 import yaml
 
-DEFAULT_BUCKET = "ovius-pipeline-apse1-610331148578"
-DEFAULT_DATA_REGION = "ap-southeast-1"
+DEFAULT_BUCKET = "ovius-pipeline-apse3-610331148578"
+DEFAULT_DATA_REGION = "ap-southeast-3"
 MODEL_PREFIX = "models/s-v5-xl"
 BUNDLE_KEY = "pipeline/ptz_code_bundle.tar.gz"
 

@@ -1,4 +1,4 @@
-"""Single-EC2 GPU systemd worker connecting S3/SQS (ap-southeast-1) to PTZ S-v5-XL pipeline (ap-southeast-3)."""
+"""Single-EC2 GPU systemd worker connecting S3/SQS/DynamoDB (ap-southeast-3) to PTZ S-v5-XL pipeline."""
 
 from __future__ import annotations
 
@@ -289,7 +289,7 @@ def _csv_to_snappy_parquet_bytes(csv_path: Path) -> bytes:
 
 
 class Ec2PipelineWorker:
-    """Runs on a persistent g5 EC2 host (ap-southeast-3) polling SQS/S3/DynamoDB (ap-southeast-1)."""
+    """Runs on a persistent g5 EC2 host (ap-southeast-3) polling SQS/S3/DynamoDB (ap-southeast-3)."""
 
     def __init__(
         self,

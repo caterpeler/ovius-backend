@@ -6,11 +6,11 @@ from decimal import Decimal
 import json
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 
 from ovius_api.handler import lambda_handler
 from ovius_api.orchestrator import lambda_handler as orchestrator_handler
-from ovius_api.uploads import UploadControlService
+from ovius_api.uploads import UploadControlService, _EC2_CLIENT_CONFIG
 
 
 def _client_error(code: str, message: str = "error") -> ClientError:
@@ -183,11 +183,16 @@ class _FakeIngestTable:
         elif "SET #st = :starting" in UpdateExpression:
             item["status"] = vals[":starting"]
             item["active_recording_id"] = vals[":rec"]
+            if ":iid" in vals:
+                item["worker_instance_id"] = vals[":iid"]
             item["lease_expires_at"] = vals[":lease"]
             item["updated_at"] = vals[":now_iso"]
         elif "SET #st = :idle" in UpdateExpression:
             item["status"] = vals[":idle"]
             item["lease_expires_at"] = vals[":zero"]
+            item["updated_at"] = vals[":now_iso"]
+        elif "SET worker_instance_id = :iid" in UpdateExpression:
+            item["worker_instance_id"] = vals[":iid"]
             item["updated_at"] = vals[":now_iso"]
         elif "SET batch_job_id = :jid" in UpdateExpression:
             item["batch_job_id"] = vals[":jid"]
@@ -959,5 +964,155 @@ def test_session_duplicate_guard_timestamp_normalization_bounds_and_derived_stat
     rec["process_status"] = "ABORTED"
     rec["upload_status"] = "ABORTED"
     assert svc.get_session_status("upl_fixed_01")["session_status"] == "ABORTED"
+
+
+def test_ec2_client_fast_fail_and_timeout_releases_lock() -> None:
+    assert _EC2_CLIENT_CONFIG.connect_timeout <= 5
+    assert _EC2_CLIENT_CONFIG.read_timeout <= 10
+    assert _EC2_CLIENT_CONFIG.retries["total_max_attempts"] == 1
+
+    class _TimeoutStartEC2:
+        def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:
+            return {
+                "Reservations": [
+                    {"Instances": [{"InstanceId": InstanceIds[0], "State": {"Name": "stopped"}}]}
+                ]
+            }
+
+        def start_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:
+            raise ReadTimeoutError(endpoint_url="https://ec2.ap-southeast-3.amazonaws.com")
+
+    class _TimeoutDescribeEC2:
+        def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:
+            raise ReadTimeoutError(endpoint_url="https://ec2.ap-southeast-3.amazonaws.com")
+
+    ddb = _FakeIngestResource()
+    svc_start_to = UploadControlService(
+        ddb_resource=ddb,
+        s3_client=_FakeS3Client(),
+        sqs_client=_FakeSQSClient(queue_exists=True),
+        ec2_client=_TimeoutStartEC2(),
+        worker_instance_id="i-0g5worker123",
+        auto_start_ec2=True,
+        now_fn=lambda: 1_700_005_000.0,
+    )
+    res_start = svc_start_to.try_start_ec2_worker("rec_timeout_01")
+    assert res_start["claimed"] is False
+    assert res_start["ec2_started"] is False
+    assert res_start["retry_in_watchdog"] is True
+    assert res_start["error_code"] == "ReadTimeoutError"
+    assert ddb.table.items[("WORKER#LOCK", "PRIMARY")]["status"] == "IDLE"
+
+    svc_desc_to = UploadControlService(
+        ddb_resource=_FakeIngestResource(),
+        s3_client=_FakeS3Client(),
+        sqs_client=_FakeSQSClient(queue_exists=True),
+        ec2_client=_TimeoutDescribeEC2(),
+        worker_instance_id="i-0g5worker123",
+        auto_start_ec2=True,
+        now_fn=lambda: 1_700_005_010.0,
+    )
+    res_desc = svc_desc_to.try_start_ec2_worker("rec_timeout_02")
+    assert res_desc["claimed"] is False
+    assert res_desc["ec2_started"] is False
+    assert res_desc["retry_in_watchdog"] is True
+    assert res_desc["error_code"] == "ReadTimeoutError"
+
+
+def test_ec2_multi_az_failover_active_guard_and_all_failed() -> None:
+    class _MultiAZEC2:
+        def __init__(self) -> None:
+            self.states: dict[str, str] = {"i-apse3c": "stopped", "i-apse3a": "stopped"}
+            self.errors: dict[str, Exception] = {
+                "i-apse3c": _client_error("InsufficientInstanceCapacity", "no g5.xlarge in 3c")
+            }
+            self.start_calls: list[str] = []
+
+        def describe_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:
+            return {
+                "Reservations": [
+                    {"Instances": [{"InstanceId": iid, "State": {"Name": self.states[iid]}}]}
+                    for iid in InstanceIds
+                    if iid in self.states
+                ]
+            }
+
+        def start_instances(self, *, InstanceIds: list[str]) -> dict[str, Any]:
+            iid = InstanceIds[0]
+            self.start_calls.append(iid)
+            if iid in self.errors:
+                raise self.errors[iid]
+            self.states[iid] = "pending"
+            return {"StartingInstances": [{"InstanceId": iid}]}
+
+    ec2 = _MultiAZEC2()
+    ddb = _FakeIngestResource()
+    svc = UploadControlService(
+        ddb_resource=ddb,
+        s3_client=_FakeS3Client(),
+        sqs_client=_FakeSQSClient(queue_exists=True),
+        ec2_client=ec2,
+        worker_instance_id="i-apse3c, i-apse3a",
+        auto_start_ec2=True,
+        now_fn=lambda: 1_700_006_000.0,
+    )
+    assert svc.worker_instance_ids == ["i-apse3c", "i-apse3a"]
+
+    created = svc.create_session(_session_payload("rec_multiaz_01"))
+    uid = created["upload_id"]
+    for idx in (0, 1):
+        p = svc.presign_chunk_parts(
+            {"upload_id": uid, "recording_id": "rec_multiaz_01", "chunk_index": idx, "part_numbers": [1]}
+        )
+        res = svc.complete_chunk(
+            {
+                "upload_id": uid,
+                "recording_id": "rec_multiaz_01",
+                "chunk_index": idx,
+                "s3_upload_id": p["s3_upload_id"],
+                "parts": [{"PartNumber": 1, "ETag": f'"m{idx}"'}],
+            }
+        )
+
+    # 1. Failover succeeds from i-apse3c -> i-apse3a and updates WORKER#LOCK.worker_instance_id
+    wlock = res["worker_lock"]
+    assert wlock["claimed"] is True
+    assert wlock["ec2_started"] is True
+    assert wlock["failover_used"] is True
+    assert wlock["instance_id"] == "i-apse3a"
+    assert wlock["attempts"] == [{"instance_id": "i-apse3c", "error_code": "InsufficientInstanceCapacity"}]
+    assert ec2.start_calls == ["i-apse3c", "i-apse3a"]
+    assert ddb.table.items[("WORKER#LOCK", "PRIMARY")]["worker_instance_id"] == "i-apse3a"
+
+    # 2. Single-active-worker guard refuses starting i-apse3c while i-apse3a is running
+    ec2.states["i-apse3a"] = "running"
+    ec2.errors.pop("i-apse3c", None)
+    before_calls = list(ec2.start_calls)
+    active = svc.try_start_ec2_worker("rec_multiaz_02")
+    assert active["ec2_started"] is False
+    assert active["reason"] == "already_active"
+    assert active["instance_id"] == "i-apse3a"
+    assert ec2.start_calls == before_calls
+
+    # 3. get_session_status surfaces the active worker_instance_id and running state
+    sess = svc.get_session_status(uid)
+    assert sess["worker_instance_id"] == "i-apse3a"
+    assert sess["worker_instance_state"] == "running"
+
+    # 4. Both AZs failing resets WORKER#LOCK to IDLE with all attempts recorded
+    ec2.states = {"i-apse3c": "stopped", "i-apse3a": "stopped"}
+    ec2.errors = {
+        "i-apse3c": _client_error("InsufficientInstanceCapacity", "no 3c"),
+        "i-apse3a": ReadTimeoutError(endpoint_url="https://ec2.ap-southeast-3.amazonaws.com"),
+    }
+    ddb.table.items[("WORKER#LOCK", "PRIMARY")]["status"] = "IDLE"
+    both_fail = svc.try_start_ec2_worker("rec_multiaz_03")
+    assert both_fail["claimed"] is False
+    assert both_fail["ec2_started"] is False
+    assert both_fail["retry_in_watchdog"] is True
+    assert len(both_fail["attempts"]) == 2
+    assert both_fail["error_code"] == "ReadTimeoutError"
+    assert ddb.table.items[("WORKER#LOCK", "PRIMARY")]["status"] == "IDLE"
+
 
 

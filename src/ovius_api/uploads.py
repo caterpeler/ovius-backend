@@ -14,7 +14,7 @@ import uuid
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from ovius_api.repository import get_dynamodb_resource, json_safe
 
@@ -36,7 +36,11 @@ _S3_CLIENT_CONFIG = Config(
 )
 _SQS_CLIENT_CONFIG = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})
 _BATCH_CLIENT_CONFIG = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})
-_EC2_CLIENT_CONFIG = Config(retries={"total_max_attempts": 10, "mode": "adaptive"})
+_EC2_CLIENT_CONFIG = Config(
+    connect_timeout=3,
+    read_timeout=5,
+    retries={"total_max_attempts": 1, "mode": "standard"},
+)
 
 _CACHED_S3_CLIENT: Any | None = None
 _CACHED_SQS_CLIENT: Any | None = None
@@ -99,6 +103,40 @@ def get_ec2_client() -> Any:
 
 def _utc_iso(epoch_s: int | float) -> str:
     return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat()
+
+
+def _parse_worker_instance_ids(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Parse a comma-separated string or sequence of EC2 instance IDs into an ordered unique list."""
+    if raw is None:
+        return []
+    tokens = raw.split(",") if isinstance(raw, str) else list(raw)
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        cleaned = str(token).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+    return result
+
+
+def _extract_ec2_error_code(exc: Exception) -> str:
+    """Return AWS Error.Code for ClientError or exception class name for BotoCoreError."""
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Code", "Unknown"))
+    return type(exc).__name__
+
+
+def _describe_worker_states(ec2: Any, instance_ids: list[str]) -> dict[str, str]:
+    """Batch-describe EC2 worker instances and map each instance ID to its state name."""
+    desc = ec2.describe_instances(InstanceIds=instance_ids)
+    state_by_id: dict[str, str] = {}
+    for res in desc.get("Reservations", []):
+        for inst in res.get("Instances", []):
+            iid = str(inst.get("InstanceId") or "")
+            if iid:
+                state_by_id[iid] = str(inst["State"]["Name"])
+    return state_by_id
 
 
 def _require_id(value: Any, field_name: str) -> str:
@@ -210,6 +248,7 @@ class UploadControlService:
         batch_job_definition: str | None = None,
         auto_submit_batch: bool | None = None,
         worker_instance_id: str | None = None,
+        worker_instance_ids: list[str] | tuple[str, ...] | str | None = None,
         auto_start_ec2: bool | None = None,
         now_fn: Callable[[], float] | None = None,
     ) -> None:
@@ -239,11 +278,18 @@ class UploadControlService:
             )
         else:
             self.auto_submit_batch = auto_submit_batch
-        self.worker_instance_id = (
-            worker_instance_id
-            if worker_instance_id is not None
-            else os.environ.get("WORKER_INSTANCE_ID", "").strip()
-        )
+        raw_worker_ids: str | list[str] | tuple[str, ...] | None
+        if worker_instance_ids is not None:
+            raw_worker_ids = worker_instance_ids
+        elif worker_instance_id is not None:
+            raw_worker_ids = worker_instance_id
+        else:
+            raw_worker_ids = (
+                os.environ.get("WORKER_INSTANCE_IDS", "")
+                or os.environ.get("WORKER_INSTANCE_ID", "")
+            )
+        self.worker_instance_ids = _parse_worker_instance_ids(raw_worker_ids)
+        self.worker_instance_id = self.worker_instance_ids[0] if self.worker_instance_ids else ""
         if auto_start_ec2 is None:
             self.auto_start_ec2 = (
                 os.environ.get("AUTO_START_EC2_WORKER", "false").strip().lower() == "true"
@@ -829,54 +875,66 @@ class UploadControlService:
             raise
 
     def try_start_ec2_worker(self, recording_id: str) -> dict[str, Any]:
-        """Wake the persistent stopped GPU EC2 worker without failing on InsufficientInstanceCapacity."""
-        if not (self.auto_start_ec2 and self.worker_instance_id):
+        """Wake the persistent stopped GPU EC2 worker with multi-AZ failover on capacity errors."""
+        if not (self.auto_start_ec2 and self.worker_instance_ids):
             return {"claimed": False, "ec2_started": False, "reason": "auto_start_ec2_disabled"}
 
         ec2 = self._ec2 or get_ec2_client()
         try:
-            desc = ec2.describe_instances(InstanceIds=[self.worker_instance_id])
-            reservations = desc.get("Reservations", [])
-            if not reservations or not reservations[0].get("Instances"):
-                return {
-                    "claimed": False,
-                    "ec2_started": False,
-                    "instance_id": self.worker_instance_id,
-                    "reason": "instance_not_found",
-                }
-            state = str(reservations[0]["Instances"][0]["State"]["Name"])
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "Unknown")
-            logger.warning("EC2 describe_instances failed for %s (%s)", self.worker_instance_id, code)
+            state_by_id = _describe_worker_states(ec2, self.worker_instance_ids)
+        except (ClientError, BotoCoreError) as exc:
+            code = _extract_ec2_error_code(exc)
+            logger.warning(
+                "EC2 describe_instances failed for %s (%s)", self.worker_instance_ids, code
+            )
             return {
                 "claimed": False,
                 "ec2_started": False,
                 "instance_id": self.worker_instance_id,
+                "attempted_instance_ids": list(self.worker_instance_ids),
                 "retry_in_watchdog": True,
                 "error_code": code,
             }
 
-        if state in {"running", "pending"}:
+        if not state_by_id:
             return {
                 "claimed": False,
                 "ec2_started": False,
                 "instance_id": self.worker_instance_id,
-                "instance_state": state,
-                "reason": "already_active",
+                "reason": "instance_not_found",
             }
-        if state != "stopped":
+
+        for iid in self.worker_instance_ids:
+            state = state_by_id.get(iid)
+            if state in {"running", "pending"}:
+                return {
+                    "claimed": False,
+                    "ec2_started": False,
+                    "instance_id": iid,
+                    "instance_state": state,
+                    "reason": "already_active",
+                }
+
+        stopped_ids = [iid for iid in self.worker_instance_ids if state_by_id.get(iid) == "stopped"]
+        if not stopped_ids:
+            first_id = next(
+                (iid for iid in self.worker_instance_ids if iid in state_by_id),
+                self.worker_instance_id,
+            )
+            first_state = state_by_id.get(first_id, "unknown")
             return {
                 "claimed": False,
                 "ec2_started": False,
-                "instance_id": self.worker_instance_id,
-                "instance_state": state,
+                "instance_id": first_id,
+                "instance_state": first_state,
                 "retry_in_watchdog": True,
-                "reason": f"instance_{state}",
+                "reason": f"instance_{first_state}",
             }
 
         now_epoch = int(self._now())
         now_iso = _utc_iso(now_epoch)
         lock_key = {"pk": "WORKER#LOCK", "sk": "PRIMARY"}
+        primary_candidate = stopped_ids[0]
         try:
             self.ingest_table.update_item(
                 Key=lock_key,
@@ -894,7 +952,7 @@ class UploadControlService:
                     ":idle": "IDLE",
                     ":exiting": "EXITING",
                     ":rec": recording_id,
-                    ":iid": self.worker_instance_id,
+                    ":iid": primary_candidate,
                     ":lease": now_epoch + 300,
                     ":now_epoch": now_epoch,
                     ":now_iso": now_iso,
@@ -905,46 +963,66 @@ class UploadControlService:
                 return {
                     "claimed": False,
                     "ec2_started": False,
-                    "instance_id": self.worker_instance_id,
+                    "instance_id": primary_candidate,
                     "reason": "lock_busy",
                 }
             raise
 
-        try:
-            ec2.start_instances(InstanceIds=[self.worker_instance_id])
-            return {
-                "claimed": True,
-                "ec2_started": True,
-                "instance_id": self.worker_instance_id,
-                "instance_state": "pending",
-            }
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "Unknown")
-            logger.warning(
-                "EC2 start_instances deferred for %s (%s); keeping work queued in SQS for watchdog retry",
-                self.worker_instance_id,
-                code,
-            )
+        attempts: list[dict[str, str]] = []
+        last_error_code = "Unknown"
+        for candidate_id in stopped_ids:
             try:
-                self.ingest_table.update_item(
-                    Key=lock_key,
-                    UpdateExpression="SET #st = :idle, lease_expires_at = :zero, updated_at = :now_iso",
-                    ExpressionAttributeNames={"#st": "status"},
-                    ExpressionAttributeValues={
-                        ":idle": "IDLE",
-                        ":zero": 0,
-                        ":now_iso": _utc_iso(int(self._now())),
-                    },
+                ec2.start_instances(InstanceIds=[candidate_id])
+                if candidate_id != primary_candidate:
+                    try:
+                        self.ingest_table.update_item(
+                            Key=lock_key,
+                            UpdateExpression="SET worker_instance_id = :iid, updated_at = :now_iso",
+                            ExpressionAttributeValues={
+                                ":iid": candidate_id,
+                                ":now_iso": _utc_iso(int(self._now())),
+                            },
+                        )
+                    except ClientError:
+                        pass
+                return {
+                    "claimed": True,
+                    "ec2_started": True,
+                    "instance_id": candidate_id,
+                    "instance_state": "pending",
+                    "failover_used": candidate_id != primary_candidate,
+                    "attempts": attempts,
+                }
+            except (ClientError, BotoCoreError) as exc:
+                last_error_code = _extract_ec2_error_code(exc)
+                attempts.append({"instance_id": candidate_id, "error_code": last_error_code})
+                logger.warning(
+                    "EC2 start_instances deferred for %s (%s); trying next AZ standby if available",
+                    candidate_id,
+                    last_error_code,
                 )
-            except ClientError:
-                pass
-            return {
-                "claimed": False,
-                "ec2_started": False,
-                "instance_id": self.worker_instance_id,
-                "retry_in_watchdog": True,
-                "error_code": code,
-            }
+
+        try:
+            self.ingest_table.update_item(
+                Key=lock_key,
+                UpdateExpression="SET #st = :idle, lease_expires_at = :zero, updated_at = :now_iso",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={
+                    ":idle": "IDLE",
+                    ":zero": 0,
+                    ":now_iso": _utc_iso(int(self._now())),
+                },
+            )
+        except ClientError:
+            pass
+        return {
+            "claimed": False,
+            "ec2_started": False,
+            "instance_id": stopped_ids[-1],
+            "retry_in_watchdog": True,
+            "error_code": last_error_code,
+            "attempts": attempts,
+        }
 
     def transition_chunk_uploaded(
         self,
@@ -1122,14 +1200,28 @@ class UploadControlService:
         worker_instance_id = (
             str(worker_item.get("worker_instance_id", "")) if worker_item else ""
         ) or self.worker_instance_id
+        candidate_ids = _parse_worker_instance_ids(
+            ([worker_instance_id] if worker_instance_id else []) + list(self.worker_instance_ids)
+        )
         worker_instance_state: str | None = None
-        if worker_instance_id and (self._ec2 is not None or self.auto_start_ec2):
+        if candidate_ids and (self._ec2 is not None or self.auto_start_ec2):
             try:
                 ec2 = self._ec2 or get_ec2_client()
-                desc = ec2.describe_instances(InstanceIds=[worker_instance_id])
-                reservations = desc.get("Reservations", [])
-                if reservations and reservations[0].get("Instances"):
-                    worker_instance_state = str(reservations[0]["Instances"][0]["State"]["Name"])
+                state_by_id = _describe_worker_states(ec2, candidate_ids)
+                active_id = next(
+                    (iid for iid in candidate_ids if state_by_id.get(iid) in {"running", "pending"}),
+                    None,
+                )
+                if active_id is not None:
+                    worker_instance_id = active_id
+                    worker_instance_state = state_by_id[active_id]
+                elif worker_instance_id and worker_instance_id in state_by_id:
+                    worker_instance_state = state_by_id[worker_instance_id]
+                else:
+                    first_known = next((iid for iid in candidate_ids if iid in state_by_id), None)
+                    if first_known is not None:
+                        worker_instance_id = first_known
+                        worker_instance_state = state_by_id[first_known]
             except Exception:  # noqa: BLE001
                 worker_instance_state = "unknown"
 

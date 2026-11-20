@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_PKG = ROOT / "src" / "ovius_api"
 
 DEFAULT_PROFILE = "610331148578_Project8Learner"
-DEFAULT_REGION = "ap-southeast-1"
+DEFAULT_REGION = "ap-southeast-3"
 DEFAULT_REPO = "ovius-vision-worker"
 DEFAULT_TAG = "latest"
 PUBLIC_BASE_REPO = "lambda/python"
